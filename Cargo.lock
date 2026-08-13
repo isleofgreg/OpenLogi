@@ -5152,6 +5152,7 @@ version = "0.6.26"
 dependencies = [
  "anyhow",
  "backon",
+ "core-graphics 0.25.0",
  "disclaim",
  "embed-resource",
  "fluent-langneg",
