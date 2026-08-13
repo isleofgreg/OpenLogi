@@ -73,7 +73,15 @@ fn authoritative_channel(
         |channel| registry.is_current(channel),
         || registry.lookup(route),
     )
-    .ok_or(WriteError::DeviceNotFound)
+    .ok_or_else(|| {
+        // Route resolution failing means every known channel for this route is
+        // gone — a cached haptic feature handle pinning one of them would
+        // deadlock the enumerator's reopen (it waits for the old channel's
+        // last Arc to drop) while itself never being invalidated, because no
+        // haptic I/O reaches the cache without a resolvable route.
+        openlogi_hid::clear_haptic_feature_cache();
+        WriteError::DeviceNotFound
+    })
 }
 
 fn choose_authoritative<T>(
@@ -697,6 +705,25 @@ pub async fn apply_smartshift(
     timed(
         HidppOperation::WriteSmartShift,
         openlogi_hid::set_smartshift_on(&shared, mode, auto_disengage, tunable_torque),
+    )
+    .await
+}
+
+/// Arm the firmware haptic engine (enable + non-zero intensity) for the
+/// device at `route`. Called once per Actions Ring session before the first
+/// hover — some power transitions clear the firmware state, after which plays
+/// are accepted silently. Returns `true` when a repair write was needed.
+pub async fn ensure_ring_haptics_armed(
+    capture: &CaptureChannel,
+    registry: &ChannelRegistry,
+    receiver_access: &ReceiverAccess,
+    route: &DeviceRoute,
+) -> Result<bool, WriteError> {
+    let _lease = receiver_access.acquire_for_io().await;
+    let shared = authoritative_channel(Some(capture), registry, route)?;
+    timed(
+        HidppOperation::PlayHaptic,
+        openlogi_hid::ensure_haptics_armed_on(&shared),
     )
     .await
 }

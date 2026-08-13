@@ -46,6 +46,7 @@ pub struct AgentServer {
     pub event_monitor: SharedEventMonitor,
     pub action_ring: Arc<ActionRingManager>,
     pub dispatcher: ActionDispatcher,
+    pub ring_haptics: RingHapticPlayer,
 }
 
 impl Agent for AgentServer {
@@ -250,12 +251,8 @@ impl Agent for AgentServer {
         slot: ActionRingSlot,
     ) -> Result<(), ActionRingCommandError> {
         if let Some(hover) = self.action_ring.hover(session_id, slot)? {
-            spawn_ring_haptic(
-                &self.shared,
-                hover.haptic_route,
-                HapticWaveform::SubtleCollision,
-                "hover",
-            );
+            self.ring_haptics
+                .play(hover.haptic_route, HapticWaveform::SubtleCollision, "hover");
         }
         Ok(())
     }
@@ -269,8 +266,7 @@ impl Agent for AgentServer {
         let activation = self.action_ring.activate(session_id, slot)?;
         self.dispatcher
             .dispatch(&activation.action, Some(&activation.device_key));
-        spawn_ring_haptic(
-            &self.shared,
+        self.ring_haptics.play(
             activation.haptic_route,
             HapticWaveform::DampStateChange,
             "activation",
@@ -283,29 +279,144 @@ impl Agent for AgentServer {
     }
 }
 
-fn spawn_ring_haptic(
-    shared: &SharedRuntime,
-    route: Option<DeviceRoute>,
-    waveform: HapticWaveform,
-    interaction: &'static str,
-) {
-    let Some(route) = route else {
-        return;
-    };
-    let shared = shared.clone();
-    tokio::spawn(async move {
-        if let Err(error) = hardware::play_haptic(
-            &shared.capture_channel,
-            &shared.channel_registry,
-            &shared.receiver_access,
-            &route,
-            waveform,
-        )
-        .await
-        {
-            warn!(%error, interaction, "Actions Ring haptic failed");
-        }
-    });
+/// Coalescing Actions Ring haptic player: at most one waveform is in flight,
+/// and while it plays only the newest queued request survives (latest wins).
+///
+/// Spawning one task per hover let a fast pointer queue HID++ plays faster
+/// than the receiver drains them; the backlog then times out every
+/// transaction on the channel for seconds at a time — dead haptics, and
+/// collateral timeouts for unrelated writes (DPI, SmartShift) on the same
+/// receiver. A stale hover buzz has no value, so dropping superseded requests
+/// is strictly better than queueing them.
+#[derive(Clone)]
+pub struct RingHapticPlayer {
+    tx: tokio::sync::watch::Sender<Option<(DeviceRoute, HapticWaveform, &'static str)>>,
+    pending_arm: Arc<std::sync::Mutex<Option<DeviceRoute>>>,
+}
+
+impl RingHapticPlayer {
+    /// Spawn the single-flight worker. Must be called from a tokio runtime.
+    pub fn spawn(shared: SharedRuntime) -> Self {
+        let (tx, mut rx) = tokio::sync::watch::channel::<
+            Option<(DeviceRoute, HapticWaveform, &'static str)>,
+        >(None);
+        let pending_arm = Arc::new(std::sync::Mutex::new(None::<DeviceRoute>));
+        let worker_arm = Arc::clone(&pending_arm);
+        tokio::spawn(async move {
+            let mut consecutive_failures = 0u32;
+            let mut cooldown_until: Option<std::time::Instant> = None;
+            while rx.changed().await.is_ok() {
+                // Firmware arming is sequenced through this worker so it is
+                // guaranteed to complete before the session's first buzz —
+                // spawning it separately let the first hover race (and lose
+                // to) a disarmed haptic engine.
+                let arm_route = worker_arm.lock().unwrap().take();
+                if let Some(route) = arm_route {
+                    for attempt in 1..=2u8 {
+                        match hardware::ensure_ring_haptics_armed(
+                            &shared.capture_channel,
+                            &shared.channel_registry,
+                            &shared.receiver_access,
+                            &route,
+                        )
+                        .await
+                        {
+                            Ok(true) => {
+                                info!("firmware haptics were disarmed — re-enabled");
+                                break;
+                            }
+                            Ok(false) => break,
+                            Err(error) => {
+                                if attempt == 2 {
+                                    warn!(%error, "could not verify firmware haptic state");
+                                }
+                            }
+                        }
+                    }
+                }
+                let request = rx.borrow_and_update().clone();
+                let Some((route, waveform, interaction)) = request else {
+                    continue;
+                };
+                // Circuit breaker: when replies keep getting lost, further
+                // attempts only keep the channel saturated (and starve
+                // unrelated writes). Skip haptics for a short cool-down so
+                // the pipe drains; feedback resumes on the next buzz after.
+                if let Some(until) = cooldown_until {
+                    if std::time::Instant::now() < until {
+                        continue;
+                    }
+                    cooldown_until = None;
+                }
+                // A busy receiver drops HID++ replies under concurrent
+                // pointer traffic, so a single attempt fails exactly when the
+                // user is actively hovering. Retry a couple of times — unless
+                // a newer request superseded this one, in which case the
+                // stale buzz is worthless and the newest plays instead.
+                for attempt in 1..=3u8 {
+                    match hardware::play_haptic(
+                        &shared.capture_channel,
+                        &shared.channel_registry,
+                        &shared.receiver_access,
+                        &route,
+                        waveform,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            consecutive_failures = 0;
+                            break;
+                        }
+                        Err(error) => {
+                            let superseded = rx.has_changed().unwrap_or(true);
+                            if attempt == 3 || superseded {
+                                consecutive_failures += 1;
+                                if consecutive_failures >= 3 {
+                                    cooldown_until = Some(
+                                        std::time::Instant::now()
+                                            + std::time::Duration::from_secs(4),
+                                    );
+                                    consecutive_failures = 0;
+                                    info!(
+                                        interaction,
+                                        "ring haptics cooling down after repeated HID++ loss"
+                                    );
+                                } else {
+                                    warn!(%error, interaction, attempt, superseded, "Actions Ring haptic failed");
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        Self { tx, pending_arm }
+    }
+
+    /// Queue a firmware arming check to run before the session's first buzz.
+    /// The wake-up send also clears any stale not-yet-played waveform from a
+    /// previous session so it cannot replay.
+    pub fn arm(&self, route: Option<DeviceRoute>) {
+        let Some(route) = route else {
+            return;
+        };
+        *self.pending_arm.lock().unwrap() = Some(route);
+        let _ = self.tx.send(None);
+    }
+
+    /// Queue `waveform`, replacing any not-yet-played request.
+    fn play(
+        &self,
+        route: Option<DeviceRoute>,
+        waveform: HapticWaveform,
+        interaction: &'static str,
+    ) {
+        let Some(route) = route else {
+            return;
+        };
+        let _ = self.tx.send(Some((route, waveform, interaction)));
+    }
 }
 
 /// Bind the agent's IPC socket and serve [`Agent`] requests until the process
