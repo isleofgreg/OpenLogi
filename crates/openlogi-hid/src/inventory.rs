@@ -59,17 +59,23 @@ const PROBE_BUDGET: Duration = Duration::from_secs(25);
 
 /// Probe budget for receiver nodes (Bolt/Unifying/Lightspeed dongles).
 ///
-/// A receiver answers its pairing/register reads over local USB in single-
-/// digit milliseconds, and its slot walks are bounded by the per-slot budgets
-/// — the 25 s [`PROBE_BUDGET`] is sized for Bluetooth-direct feature walks
-/// that receivers never perform. Keeping the receiver budget tight matters
+/// The 25 s [`PROBE_BUDGET`] is sized for Bluetooth-direct feature walks that
+/// receivers never perform. Keeping the receiver budget tighter matters
 /// because a full-budget timeout is also the detection path for a channel
 /// whose input-report delivery died (observed on macOS with concurrent opens
 /// of the same node: requests keep being written and answered, but the
 /// replies are delivered only to the other open handle). Until the channel is
 /// replaced every write on it stalls — DPI, SmartShift, ring haptics — so
 /// this budget bounds that outage.
-const RECEIVER_PROBE_BUDGET: Duration = Duration::from_secs(6);
+///
+/// It must still fit a receiver probe's real worst case, which is NOT the
+/// millisecond register reads but a paired device's full HID++ 2.0 feature
+/// walk: 1.5 s arrival drain + the sequential pairing-register pass + one
+/// slot's [`BOLT_SLOT_PROBE`] (10 s). 6 s proved too tight — a legitimate
+/// deep walk tripped the dead-delivery eviction, the surfaced-empty inventory
+/// tore down capture plans, and a pinned stale channel Arc then deadlocked
+/// recovery (dead buttons until restart). 13 s clears the honest worst case.
+const RECEIVER_PROBE_BUDGET: Duration = Duration::from_secs(13);
 
 /// Per-slot budget for the HID++ 2.0 feature walk on a Unifying paired device.
 ///
