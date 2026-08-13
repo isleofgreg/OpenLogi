@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.27] - 2026-08-13
+
+### Added
+
+- *(core)* support stable Windows app selectors ([#572](https://github.com/AprilNEA/OpenLogi/pull/572))
+- *(gui)* add capability-driven actions ring ([#528](https://github.com/AprilNEA/OpenLogi/pull/528))
+- *(hid)* persist the immutable probe cache across restarts ([#564](https://github.com/AprilNEA/OpenLogi/pull/564))
+- *(gui)* back navigation via the mouse's back button and Alt+Left ([#563](https://github.com/AprilNEA/OpenLogi/pull/563))
+- capture the MX Master 4 haptic panel as a first-class control ([#565](https://github.com/AprilNEA/OpenLogi/pull/565))
+- *(hid)* recognise Lightspeed receiver 046d:c547 (G915, G502 X) ([#574](https://github.com/AprilNEA/OpenLogi/pull/574))
+- *(hid,hidpp)* read battery over BatteryVoltage (0x1001) ([#575](https://github.com/AprilNEA/OpenLogi/pull/575))
+
+### Fixed
+
+- *(hid)* widen the Bolt per-slot probe budget for high-latency USB paths ([#562](https://github.com/AprilNEA/OpenLogi/pull/562))
+- *(macos)* prevent corrupted small app icons ([#570](https://github.com/AprilNEA/OpenLogi/pull/570))
+- *(hook)* release macOS tap after accessibility revocation ([#578](https://github.com/AprilNEA/OpenLogi/pull/578))
+- *(ui)* prevent middle and thumb wheel popover flicker ([#559](https://github.com/AprilNEA/OpenLogi/pull/559))
+
 ## [0.6.26] - 2026-08-10
 
 ### Fixed
