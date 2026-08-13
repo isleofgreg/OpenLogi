@@ -340,10 +340,7 @@ mod tests {
         spec.layout
             .set_label(ActionRingSlot::Top, Some("Copy Invoice".to_string()));
         let invocation = manager.begin(spec);
-        assert_eq!(
-            invocation.slots[&ActionRingSlot::Top].label,
-            "Copy Invoice"
-        );
+        assert_eq!(invocation.slots[&ActionRingSlot::Top].label, "Copy Invoice");
     }
 
     #[test]
