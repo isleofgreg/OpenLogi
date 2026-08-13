@@ -173,6 +173,10 @@ async fn begin_action_ring(
     ring_haptics: &server::RingHapticPlayer,
     device_key: Option<&str>,
 ) {
+    // A second trigger press while the ring is showing closes it.
+    if action_ring.dismiss_active() {
+        return;
+    }
     if let Some(session) = orchestrator.lock().await.action_ring_session(device_key) {
         // Arm the firmware haptic engine before the first buzz: some power
         // transitions clear its enabled state, after which plays are accepted
