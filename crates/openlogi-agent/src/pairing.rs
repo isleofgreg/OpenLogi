@@ -406,6 +406,7 @@ mod tests {
             scroll_preferences: Arc::new(ScrollPreferences::new(
                 false,
                 VerticalScrollSensitivity::DEFAULT,
+                openlogi_core::config::SmoothScrollTuning::default(),
             )),
             dpi_cycle: Arc::new(RwLock::new(DpiCycles::default())),
             capture_plans,
