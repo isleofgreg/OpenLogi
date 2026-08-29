@@ -662,6 +662,13 @@ pub(super) fn post_smooth_scroll(delta: ScrollDelta, phase: SmoothScrollPhase) {
     let delta = quantizer.quantize(delta, units_per_input);
     drop(quantizer);
 
+    // Sub-pixel frames quantize to zero; posting them would only flood the
+    // event stream. Phase transitions must still reach the application even
+    // with no distance left to carry.
+    if delta == QuantizedScroll::default() && matches!(phase, SmoothScrollPhase::Changed) {
+        return;
+    }
+
     let Ok(src) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
         tracing::warn!("CGEventSource::new failed for smooth scroll");
         return;
@@ -675,7 +682,14 @@ pub(super) fn post_smooth_scroll(delta: ScrollDelta, phase: SmoothScrollPhase) {
     ev.set_integer_value_field(SCROLL_PHASE, scroll_phase_value(phase));
     ev.set_integer_value_field(MOMENTUM_PHASE, 0);
     tag_synthetic(&ev);
-    ev.post(CGEventTapLocation::HID);
+    // Session level, not HID: WindowServer reprocesses HID-posted continuous
+    // events and regenerates their point delta from the *integer line* field
+    // (8 points per line), so any frame under 10 posted points arrives at the
+    // application as zero and the rest quantize to 8-point steps — measured on
+    // macOS 15.7: a slow animated wheel stream lost 77% of its distance.
+    // Session-posted events skip that pipeline and deliver the pixel-precise
+    // fields untouched.
+    ev.post(CGEventTapLocation::Session);
 }
 
 const fn scroll_phase_value(phase: SmoothScrollPhase) -> i64 {
