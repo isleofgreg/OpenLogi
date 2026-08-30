@@ -23,7 +23,7 @@ use openlogi_core::device::{
 };
 use openlogi_core::device_order::{DeviceIdentity, DeviceStableId, PhysicalDeviceKey};
 use openlogi_hid::{
-    CaptureChannel, ChannelPool, ChannelRegistry, DIRECT_DEVICE_INDEX, DeviceRoute,
+    CaptureChannel, ChannelPool, ChannelRegistry, DIRECT_DEVICE_INDEX, DeviceIoGate, DeviceRoute,
     KEYBOARD_KEY_CIDS,
 };
 use openlogi_ipc::InventoryHealth;
@@ -89,6 +89,8 @@ pub struct SharedRuntime {
     pub capture_channel: CaptureChannel,
     /// Exact-route channels owned and published by the inventory enumerator.
     pub channel_registry: ChannelRegistry,
+    /// Host-lifecycle gate shared by every producer of proactive device I/O.
+    pub device_io: DeviceIoGate,
     /// Shared transport pool used by long-running host-switch sessions.
     pub channel_pool: ChannelPool,
     /// The keyboard key-capture watcher's target + bindings, `None` while no
@@ -118,6 +120,7 @@ impl SharedRuntime {
             &self.capture_channel,
             &self.channel_registry,
             &self.receiver_access,
+            &self.device_io,
             route,
         )
     }
@@ -131,6 +134,7 @@ impl SharedRuntime {
             &self.keyboard_channel,
             &self.channel_registry,
             &self.receiver_access,
+            &self.device_io,
             route,
         )
     }
@@ -149,16 +153,19 @@ pub struct Orchestrator {
     /// the distinction (as [`InventoryHealth`]) so the GUI can tell them
     /// apart.
     inventory: InventoryState,
-    /// Set after a system wake: devices may have power-cycled while their
-    /// set/route/online state looks identical across the sleep gap, so the
-    /// next refresh re-applies volatile settings to every online device.
-    reapply_all_next_refresh: bool,
-    /// Whether the last enumeration tick failed to open HID++ nodes; published
+    /// Set after a system wake or a device's own reconnect broadcast: devices
+    /// may have power-cycled while their set/route/online state looks
+    /// identical across the gap, so the next refresh re-applies volatile
+    /// settings to every online device. The value is the confirming re-apply
+    /// budget the forced targets are queued with — a system wake keeps the
+    /// boot-race ladder, a device reconnect needs only a link-race confirm.
+    forced_reapply_budget: Option<u8>,
+    /// Whether the last enumeration pass failed to open HID++ nodes; published
     /// atomically with the inventory so no observation pairs a fresh device
     /// set with a stale flag.
     hid_open_failures: bool,
-    /// Config keys of devices first sighted (or wake-flagged) recently, with
-    /// remaining confirming re-apply budget: the first write can race the
+    /// Config keys of devices first sighted (or targeted after wake) recently,
+    /// with remaining confirming re-apply budget: the first write can race the
     /// device's own boot or reconnect and be lost.
     reapply_followup: HashMap<String, u8>,
     /// Last successful aggregate camera-use sample. `None` means the macOS
@@ -222,6 +229,7 @@ impl Orchestrator {
             capture_plans,
             capture_channel: Arc::new(RwLock::new(None)),
             channel_registry: ChannelRegistry::default(),
+            device_io: openlogi_hid::host::device_io_gate(),
             channel_pool: openlogi_hid::host::channel_pool(),
             keyboard_spec,
             keyboard_channel: Arc::new(RwLock::new(None)),
@@ -235,7 +243,7 @@ impl Orchestrator {
             current: 0,
             current_app: None,
             inventory: InventoryState::Pending,
-            reapply_all_next_refresh: false,
+            forced_reapply_budget: None,
             hid_open_failures: false,
             reapply_followup: HashMap::new(),
             camera_active: None,
@@ -288,7 +296,29 @@ impl Orchestrator {
                 gestures.remove(button);
             }
         }
-        HookMaps { bindings, gestures }
+        HookMaps {
+            bindings,
+            gestures,
+            selected_device: key.map(str::to_owned),
+            ..HookMaps::default()
+        }
+    }
+
+    /// Publish hook maps while preserving thumb-wheel polarities learned from
+    /// hardware capture sessions. Selection, polarity, and bindings share the
+    /// one lock the callback reads, so a device switch cannot combine facts
+    /// from two devices.
+    fn publish_hook_maps(&self, mut maps: HookMaps) {
+        match self.shared.hook_maps.write() {
+            Ok(mut current) => {
+                maps.thumbwheel_positive_is_forward =
+                    std::mem::take(&mut current.thumbwheel_positive_is_forward);
+                *current = maps;
+            }
+            Err(error) => {
+                warn!(%error, lock = "hook_maps", "lock poisoned — keeping stale value");
+            }
+        }
     }
 
     /// The keyboard key-capture spec for the first known keyboard, or `None`
@@ -336,13 +366,7 @@ impl Orchestrator {
     /// Rewrite every shared map from the current config + selected device.
     fn rebuild(&self) {
         let key = self.current_key();
-        // One write publishes both hook maps atomically, so a button press during
-        // an owner switch can't observe a half-updated state.
-        write_value(
-            &self.shared.hook_maps,
-            self.hook_maps_for(key, self.current_app.as_deref()),
-            "hook_maps",
-        );
+        self.publish_hook_maps(self.hook_maps_for(key, self.current_app.as_deref()));
         self.publish_device_runtime();
     }
 
@@ -453,7 +477,7 @@ impl Orchestrator {
     /// altering the device *set*), but only re-picks the selection and rebuilds
     /// the shared maps when the device set or runtime selection changed —
     /// `rebuild()` is driven by `config_key` + route and resets the live
-    /// DPI-cycle index, so running it every 2s tick on a steady selection
+    /// DPI-cycle index, so running it on every steady reconciliation
     /// would snap DPI back to `preset[0]` (and burn three `RwLock` writes)
     /// for nothing.
     pub fn refresh_inventory(
@@ -476,14 +500,15 @@ impl Orchestrator {
         // wheel mode) live in device RAM and reset on a power cycle. Every
         // reconnect shape re-applies the persisted values (#189): a first
         // sighting, a replug (new route), a wake from device sleep
-        // (offline→online), or — via the
-        // flag — a system wake where none of those are observable.
-        let reapply_all = std::mem::take(&mut self.reapply_all_next_refresh);
+        // (offline→online), or — via the forced budget — a system wake or a
+        // device's own `0x1d4b` reconnect broadcast, where none of those
+        // transitions are observable.
+        let forced = self.forced_reapply_budget.take();
         let next_current = pick_current(&devices, self.config.selected_device());
-        let rearm_capture = any_device_needs_capture_rearm(&self.devices, &devices, reapply_all);
+        let rearm_capture =
+            any_device_needs_capture_rearm(&self.devices, &devices, forced.is_some());
         let followup = std::mem::take(&mut self.reapply_followup);
-        let (targets, next_followup) =
-            plan_reapply(&self.devices, &devices, &followup, reapply_all);
+        let (targets, next_followup) = plan_reapply(&self.devices, &devices, &followup, forced);
         self.reapply_followup = next_followup;
         for idx in targets {
             self.reapply_volatile_settings(&devices[idx]);
@@ -520,13 +545,41 @@ impl Orchestrator {
         self.rebuild();
     }
 
+    /// Whether volatile-setting writes still need a delayed inventory pass to
+    /// confirm them after device boot or system resume.
+    #[must_use]
+    pub fn needs_reapply_confirmation(&self) -> bool {
+        !self.reapply_followup.is_empty()
+    }
+
     /// Force a volatile-settings re-apply for every online device on the next
     /// inventory refresh. Called on a detected system wake: the devices were
     /// likely power-cycled during the sleep, but the first post-wake snapshot
     /// can look identical to the last pre-sleep one (same set, same routes,
     /// already online), so the per-device transition triggers never fire.
     pub fn reapply_volatile_on_next_refresh(&mut self) {
-        self.reapply_all_next_refresh = true;
+        self.force_reapply(VOLATILE_REAPPLY_CONFIRM_RETRIES);
+    }
+
+    /// Force a volatile-settings re-apply on the next inventory refresh
+    /// because a device broadcast its own reconnection (`0x1d4b`). The
+    /// firmware is explicitly asking to be reconfigured, and — as after a
+    /// system wake — the snapshot that follows can look identical to the last
+    /// one (a nap short enough that no reconciliation ever observed the
+    /// device offline), so the offline→online trigger cannot be relied on.
+    /// The event channel is identity-free by design, so every online device
+    /// re-applies; the writes are idempotent and the confirm budget is the
+    /// short link-race one, not the boot ladder.
+    pub fn reapply_reconnected_on_next_refresh(&mut self) {
+        self.force_reapply(RECONNECT_REAPPLY_CONFIRM_RETRIES);
+    }
+
+    /// Coalesce forced re-apply requests, keeping the largest confirm budget:
+    /// a device reconnect arriving between a system wake and its snapshot must
+    /// not shrink the wake's boot-race ladder.
+    fn force_reapply(&mut self, confirm_retries: u8) {
+        self.forced_reapply_budget =
+            Some(self.forced_reapply_budget.unwrap_or(0).max(confirm_retries));
     }
 
     /// Push the persisted volatile settings (lighting, sensor DPI, SmartShift,
@@ -574,7 +627,12 @@ impl Orchestrator {
         if let Some(capabilities) = dev.light_capabilities
             && let Some(light) = self.effective_light_settings(key)
         {
-            crate::hardware::set_light_in_background(Some(route), &light, capabilities);
+            crate::hardware::set_light_in_background(
+                &self.shared.device_io,
+                Some(route),
+                &light,
+                capabilities,
+            );
         }
     }
 
@@ -604,7 +662,12 @@ impl Orchestrator {
                 continue;
             };
             light.enabled = active;
-            crate::hardware::set_light_in_background(dev.route.clone(), &light, capabilities);
+            crate::hardware::set_light_in_background(
+                &self.shared.device_io,
+                dev.route.clone(),
+                &light,
+                capabilities,
+            );
             applied += 1;
         }
         info!(previous = ?previous, active, lights = applied, "applied camera-linked light state");
@@ -789,11 +852,7 @@ impl Orchestrator {
             return false;
         }
         self.current_app = id;
-        write_value(
-            &self.shared.hook_maps,
-            self.hook_maps_for(self.current_key(), self.current_app.as_deref()),
-            "hook_maps",
-        );
+        self.publish_hook_maps(self.hook_maps_for(self.current_key(), self.current_app.as_deref()));
         // Capture plans are app-scoped (per-app binding overlays); republish
         // them with the keyboard's effective bindings.
         self.publish_device_runtime();
@@ -860,7 +919,12 @@ impl Orchestrator {
                 self.effective_light_settings(&dev.config_key),
                 dev.light_capabilities,
             ) {
-                crate::hardware::set_light_in_background(dev.route.clone(), &light, capabilities);
+                crate::hardware::set_light_in_background(
+                    &self.shared.device_io,
+                    dev.route.clone(),
+                    &light,
+                    capabilities,
+                );
             }
         }
     }
@@ -1061,41 +1125,57 @@ fn any_device_needs_capture_rearm(
     !reapply_targets(prev, next, reapply_all).is_empty()
 }
 
-/// How many inventory ticks a first-sighted or wake-flagged device keeps
-/// re-applying its volatile settings after the initial write. A cold restart
-/// leaves a Bolt/Unifying mouse slow to enumerate — and a system wake can
-/// enumerate a receiver whose mouse link is still re-establishing — so the
-/// first write (and a single confirm) can both time out against a
-/// still-booting device; retrying for ~8s at the 2s cadence lets the write
-/// land once it finishes booting.
+/// How many explicit confirmation passes a first-sighted or wake-targeted
+/// device keeps re-applying its volatile settings after the initial write. A
+/// cold restart leaves a Bolt/Unifying mouse slow to enumerate — and a system
+/// wake can enumerate a receiver whose mouse link is still re-establishing —
+/// so the first write (and a single confirm) can both time out against a
+/// still-booting device. Four confirmations are requested at two-second
+/// intervals; any intervening authoritative reconciliation satisfies one.
 const VOLATILE_REAPPLY_CONFIRM_RETRIES: u8 = 4;
 
+/// The shorter confirmation budget for a link re-establishment (a device nap
+/// ending in an offline→online transition or a `0x1d4b` reconnect broadcast).
+/// The device was already booted, so it needs no boot-race ladder — but its
+/// single re-apply races the link still stabilizing, and drowsy firmware can
+/// ACK a write yet drop it, leaving the wrong sensor DPI live until the *next*
+/// nap. One confirming pass closes that hole without per-nap churn.
+const RECONNECT_REAPPLY_CONFIRM_RETRIES: u8 = 1;
+
 /// Plan this refresh's volatile-settings writes: the [`reapply_targets`] set
-/// plus a bounded run of confirming re-applies for devices first sighted
-/// recently or targeted by a system wake, and the follow-up keys (with
-/// remaining retry counts) to confirm next refresh. Reconnects
-/// (offline→online) re-apply once — the device was already booted, so it
-/// needs no boot-race retry.
+/// plus a bounded run of confirming re-applies, and the follow-up keys (with
+/// remaining retry counts) to confirm next refresh. `forced` re-applies to
+/// every online device carrying the caller's confirm budget (system wake
+/// keeps the boot ladder, a device reconnect the single link-race confirm);
+/// first sightings always queue the full boot ladder, and plain
+/// offline→online reconnects queue the link-race confirm.
 fn plan_reapply(
     prev: &[AgentDevice],
     next: &[AgentDevice],
     followup: &HashMap<String, u8>,
-    reapply_all: bool,
+    forced: Option<u8>,
 ) -> (Vec<usize>, HashMap<String, u8>) {
-    let mut targets = reapply_targets(prev, next, reapply_all);
+    let mut targets = reapply_targets(prev, next, forced.is_some());
     let mut next_followup: HashMap<String, u8> = targets
         .iter()
-        .filter(|&&idx| {
-            reapply_all || {
-                let id = stable_id(&next[idx]);
-                !prev.iter().any(|p| stable_id(p) == id)
-            }
-        })
-        .map(|&idx| {
-            (
-                next[idx].config_key.clone(),
-                VOLATILE_REAPPLY_CONFIRM_RETRIES,
-            )
+        .filter_map(|&idx| {
+            let id = stable_id(&next[idx]);
+            let new_identity = !prev.iter().any(|p| stable_id(p) == id);
+            let budget = if new_identity {
+                VOLATILE_REAPPLY_CONFIRM_RETRIES
+            } else if let Some(forced) = forced {
+                forced
+            } else {
+                RECONNECT_REAPPLY_CONFIRM_RETRIES
+            };
+            // A new trigger can land mid-run (a reconnect while the boot
+            // confirmations are still draining) — keep the larger of the
+            // fresh budget and what this pass would have drained to.
+            let carried = followup
+                .get(&next[idx].config_key)
+                .map_or(0, |remaining| remaining.saturating_sub(1));
+            let budget = budget.max(carried);
+            (budget > 0).then(|| (next[idx].config_key.clone(), budget))
         })
         .collect();
     for (idx, dev) in next.iter().enumerate() {

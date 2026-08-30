@@ -16,6 +16,7 @@ tracing = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev = { workspace = true }
+futures-lite = { workspace = true }
 libc = "0.2"
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
@@ -50,6 +51,7 @@ objc2-foundation = { workspace = true, features = [
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_System_Threading",
+    "Win32_UI_Accessibility",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }

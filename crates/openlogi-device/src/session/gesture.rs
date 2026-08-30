@@ -17,6 +17,8 @@
 //! is therefore only diverted when the user's thumbwheel config leaves its
 //! defaults (click bound, rotation rebound, or sensitivity changed).
 
+mod liveness;
+
 use std::sync::{Arc, Mutex, PoisonError};
 
 use hidpp::{
@@ -33,9 +35,11 @@ use openlogi_core::binding::{ButtonId, GestureDirection, SwipeAccumulator};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
-use crate::backend::HidBackend;
+use crate::backend::{BackendError, HidBackend};
 use crate::channel::route::{DeviceRoute, open_route_channel};
-use crate::{ChannelRegistry, SharedChannel};
+use crate::{ChannelRegistry, DeviceIoGate, SharedChannel};
+
+use liveness::{CaptureLiveness, ChannelActivity, LivenessDecision, PingOutcome};
 
 #[cfg(test)]
 use super::capture_restore::undivert_change;
@@ -49,16 +53,7 @@ pub use super::capture_restore::{
     PendingCaptureRestore,
 };
 use crate::reprog_controls::{self, RawControlEvent, ReprogControlsV4};
-use crate::thumbwheel::{self, Thumbwheel, WheelDirection, WheelResolution};
-
-/// How often the capture session pings its device to prove the channel still
-/// delivers input reports. Cheap: one HID++ round-trip per interval.
-const LIVENESS_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
-
-/// Consecutive all-silent pings after which the capture channel is declared
-/// dead. Two, so one ping lost to transient receiver congestion (which does
-/// happen under pointer load) doesn't churn the session.
-const LIVENESS_PING_STRIKES: u8 = 2;
+use crate::thumbwheel::{self, Thumbwheel, ThumbwheelInfo, WheelDirection, WheelResolution};
 
 /// One input captured from the active device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,13 +68,23 @@ pub enum CapturedInput {
     /// Emitted while the wheel is diverted (click bound, rotation rebound, or
     /// sensitivity changed).
     Scroll {
-        /// Rotation in the wheel's diverted increments.
+        /// Rotation in the wheel's diverted increments. Positive is always
+        /// physical forward/up: arming normalises the model-specific polarity
+        /// reported by `0x2150 default_dir`.
         increments: i16,
         /// What one revolution measures in each mode, so the dispatcher can
         /// scale those increments back to the wheel's native scroll amount
         /// instead of scrolling by however finely this wheel happens to
         /// report.
         resolution: WheelResolution,
+    },
+    /// The un-inverted polarity learned while arming a thumb wheel. This is a
+    /// one-time session fact rather than user input; the agent records it for
+    /// native horizontal-wheel events that the Windows hook cannot attribute
+    /// to a device.
+    ThumbwheelDirection {
+        /// Whether a positive native delta is physical forward/up.
+        positive_is_forward: bool,
     },
     /// A diverted button's physical up edge.
     ButtonUp(ButtonId),
@@ -232,13 +237,20 @@ pub async fn run_capture_session(
     sink: mpsc::UnboundedSender<CapturedInput>,
     shutdown: oneshot::Receiver<()>,
     channel_slot: CaptureChannel,
+    device_io: DeviceIoGate,
 ) -> Result<CaptureSessionOutcome, CaptureSessionFailure> {
+    if !device_io.allows_io() {
+        return Err(GestureError::Hid(BackendError::Backend(
+            "host device I/O is suspended".into(),
+        ))
+        .into());
+    }
     let chan = open_route_channel(backend, &route)
         .await
         .map_err(GestureError::from)?
         .ok_or(GestureError::DeviceNotFound)?;
     let shared = SharedChannel::new(chan, route.clone());
-    run_capture_session_on(shared, spec, sink, shutdown, channel_slot, None).await
+    run_capture_session_on(shared, spec, sink, shutdown, channel_slot, None, device_io).await
 }
 
 /// Capture through the inventory-owned channel currently published for
@@ -252,11 +264,21 @@ pub async fn run_capture_session_with_registry_spec(
     shutdown: oneshot::Receiver<()>,
     channel_slot: CaptureChannel,
     registry: &ChannelRegistry,
+    device_io: DeviceIoGate,
 ) -> Result<CaptureSessionOutcome, CaptureSessionFailure> {
     let shared = registry
         .lookup(&route)
         .ok_or(GestureError::DeviceNotFound)?;
-    run_capture_session_on(shared, spec, sink, shutdown, channel_slot, Some(registry)).await
+    run_capture_session_on(
+        shared,
+        spec,
+        sink,
+        shutdown,
+        channel_slot,
+        Some(registry),
+        device_io,
+    )
+    .await
 }
 
 async fn run_capture_session_on(
@@ -266,10 +288,21 @@ async fn run_capture_session_on(
     shutdown: oneshot::Receiver<()>,
     channel_slot: CaptureChannel,
     registry: Option<&ChannelRegistry>,
+    device_io: DeviceIoGate,
 ) -> Result<CaptureSessionOutcome, CaptureSessionFailure> {
+    if !device_io.allows_io() {
+        return Err(GestureError::Hid(BackendError::Backend(
+            "host device I/O is suspended".into(),
+        ))
+        .into());
+    }
     let chan = Arc::clone(shared.channel());
     let device_index = shared.device_index();
     let armed = arm_controls(&chan, device_index, &spec, &shared, registry).await?;
+
+    if let Some(direction) = armed.thumbwheel_direction() {
+        let _ = sink.send(direction);
+    }
 
     // Publish this device's open channel so DPI/SmartShift writes reuse it
     // instead of opening their own. Cleared on the way out.
@@ -284,17 +317,22 @@ async fn run_capture_session_on(
     let thumb_index = armed
         .thumb
         .as_ref()
-        .map(|(thumbwheel, _)| thumbwheel.feature_index());
+        .map(|thumb| thumb.wheel.feature_index());
     let thumb_resolution = armed
         .thumb
         .as_ref()
-        .map_or(WheelResolution::UNKNOWN, |(_, res)| *res);
+        .map_or(WheelResolution::UNKNOWN, ArmedThumbwheel::resolution);
     let dpi_set = armed.dpi_cids.clone();
     let button_set = armed.button_cids.clone();
+    let activity = Arc::new(ChannelActivity::default());
     let listener = chan.add_msg_listener_guarded({
         let accum = Arc::clone(&accum);
+        let activity = Arc::clone(&activity);
         let sink = sink.clone();
         move |raw, matched| {
+            // Every parsed inbound HID++ report proves this channel's read
+            // path is alive, including responses matched to another request.
+            activity.record();
             if matched {
                 return;
             }
@@ -331,9 +369,10 @@ async fn run_capture_session_on(
     // replies and events silently routed elsewhere) turns every captured
     // button to dead air with nothing to notice. Ping the device through this
     // channel; consecutive all-silent pings mean the channel — not the device
-    // — is gone (a sleeping/unreachable device still gets us an error *reply*,
-    // which proves delivery and resets the count). Exiting lets the manager
-    // re-arm on a fresh channel.
+    // — is gone (a sleeping/unreachable device can still send an HID++ error
+    // reply, which proves delivery and resets the count). A transport/setup
+    // error proves neither delivery nor silence, so it restarts immediately.
+    // Exiting lets the manager re-arm on a fresh channel.
     let root = RootFeature::new(Arc::clone(&chan), device_index, 0);
     let wireless = root
         .get_feature(WirelessDeviceStatusFeature::ID)
@@ -350,9 +389,11 @@ async fn run_capture_session_on(
             device_index,
             registry,
             shared: &shared,
+            activity: &activity,
         },
         wireless,
         shutdown,
+        device_io,
     )
     .await;
 
@@ -439,12 +480,44 @@ struct ArmedControls {
     button_cids: Vec<(u16, ButtonId)>,
     /// Original reporting state for every diverted `0x1b04` control.
     reporting: Vec<ArmedReporting>,
-    /// `0x2150` accessor and the wheel's reported resolution, present when the
-    /// thumb wheel is diverted.
-    thumb: Option<(Thumbwheel, WheelResolution)>,
+    /// `0x2150` accessor and the information read while diverting it, present
+    /// when the thumb wheel is diverted.
+    thumb: Option<ArmedThumbwheel>,
+}
+
+struct ArmedThumbwheel {
+    wheel: Thumbwheel,
+    info: Option<ThumbwheelInfo>,
+}
+
+impl ArmedThumbwheel {
+    fn resolution(&self) -> WheelResolution {
+        self.info
+            .map_or(WheelResolution::UNKNOWN, |info| info.resolution)
+    }
+
+    fn direction(&self) -> WheelDirection {
+        if self.info.is_some_and(|info| !info.positive_is_forward()) {
+            WheelDirection::Inverted
+        } else {
+            WheelDirection::Default
+        }
+    }
 }
 
 impl ArmedControls {
+    /// Build the one-time polarity fact learned while arming the thumb wheel.
+    fn thumbwheel_direction(&self) -> Option<CapturedInput> {
+        let positive_is_forward = self
+            .thumb
+            .as_ref()?
+            .info
+            .map(ThumbwheelInfo::positive_is_forward)?;
+        Some(CapturedInput::ThumbwheelDirection {
+            positive_is_forward,
+        })
+    }
+
     /// Convert all armed firmware state into the one capability that can
     /// release it. Consuming `self` prevents a session and a restore retry from
     /// both claiming ownership at once.
@@ -460,17 +533,18 @@ impl ArmedControls {
         PendingCaptureRestore::new(
             retired,
             reprog,
-            thumb
-                .as_ref()
-                .map(|(thumbwheel, _)| thumbwheel.feature_index()),
+            thumb.as_ref().map(|thumb| thumb.wheel.feature_index()),
         )
     }
 
     /// Reapply volatile diversion after a wireless reconnect broadcast. The
     /// broadcast can precede the device accepting feature writes, so allow a
     /// short settling window like the keyboard capture path does.
-    async fn rearm(&self) {
+    async fn rearm(&self, device_io: &DeviceIoGate) {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        if !device_io.allows_io() {
+            return;
+        }
         if let Some(rc) = self.reprog.as_ref() {
             for &reporting in &self.reporting {
                 let raw_xy = self.gesture_cids.contains(&reporting.cid)
@@ -488,8 +562,8 @@ impl ArmedControls {
                 }
             }
         }
-        if let Some((thumbwheel, _)) = self.thumb.as_ref()
-            && let Err(error) = thumbwheel.divert(WheelDirection::Default).await
+        if let Some(thumb) = self.thumb.as_ref()
+            && let Err(error) = thumb.wheel.divert(thumb.direction()).await
         {
             warn!(?error, "thumb-wheel re-divert after wake failed");
         }
@@ -517,6 +591,7 @@ struct CaptureMonitor<'a> {
     device_index: u8,
     registry: Option<&'a ChannelRegistry>,
     shared: &'a SharedChannel,
+    activity: &'a ChannelActivity,
 }
 
 /// Keep a capture session alive and reapply its volatile diversions whenever
@@ -526,18 +601,36 @@ async fn monitor_capture(
     context: CaptureMonitor<'_>,
     wireless: Option<WirelessDeviceStatusFeature>,
     shutdown: oneshot::Receiver<()>,
+    mut device_io: DeviceIoGate,
 ) -> CaptureStop {
     let mut wake_events = wireless.as_ref().map(EmittingFeature::listen);
     let mut shutdown = std::pin::pin!(shutdown);
-    let mut silent_pings = 0u8;
+    let mut liveness =
+        CaptureLiveness::new(tokio::time::Instant::now(), context.activity.generation());
     loop {
-        tokio::select! {
-            _ = &mut shutdown => {
-                // Shutdown and inventory replacement can become ready on the
-                // same turn. Prefer the typed channel transition so teardown
-                // never blindly writes through a transport already known to
-                // be obsolete.
+        if !device_io.allows_io() {
+            if !device_io.wait_until_allowed().await {
                 return stop_for_current_publication(context.registry, context.shared);
+            }
+            // Time asleep is not channel idleness. Give the transport a full
+            // quiet interval after visible resume and clear any pre-sleep
+            // strike before considering a liveness ping.
+            liveness.record_activity(tokio::time::Instant::now(), context.activity.generation());
+        }
+        let activity_generation = liveness.activity_generation();
+        let idle_deadline = liveness.idle_deadline();
+        tokio::select! {
+            biased;
+
+            allowed = device_io.changed() => {
+                match allowed {
+                    Some(true) => liveness.record_activity(
+                        tokio::time::Instant::now(),
+                        context.activity.generation(),
+                    ),
+                    Some(false) => {}
+                    None => return stop_for_current_publication(context.registry, context.shared),
+                }
             }
             transition = wait_for_channel_change(
                 context.registry,
@@ -545,6 +638,13 @@ async fn monitor_capture(
             ) => {
                 info!(index = context.device_index, "inventory replaced or removed capture channel — restarting session");
                 return transition;
+            }
+            _ = &mut shutdown => {
+                // Shutdown and inventory replacement can become ready on the
+                // same turn. Prefer the typed channel transition so teardown
+                // never blindly writes through a transport already known to
+                // be obsolete.
+                return stop_for_current_publication(context.registry, context.shared);
             }
             event = async {
                 match wake_events.as_ref() {
@@ -559,23 +659,39 @@ async fn monitor_capture(
                 info!(?broadcast, "device reconnected — re-arming control capture");
                 *context.accum.lock().unwrap_or_else(PoisonError::into_inner) =
                     CaptureAccum::default();
-                context.armed.rearm().await;
+                context.armed.rearm(&device_io).await;
             }
-            () = tokio::time::sleep(LIVENESS_PING_INTERVAL) => {
-                match context.root.ping(0x5a).await {
+            generation = context.activity.changed_after(activity_generation) => {
+                liveness.record_activity(tokio::time::Instant::now(), generation);
+            }
+            () = tokio::time::sleep_until(idle_deadline) => {
+                if !liveness.ping_due(
+                    tokio::time::Instant::now(),
+                    context.activity.generation(),
+                ) {
+                    continue;
+                }
+                let outcome = match context.root.ping(0x5a).await {
                     Err(v20::Hidpp20Error::Channel(
                         hidpp::channel::ChannelError::Timeout
                         | hidpp::channel::ChannelError::NoResponse,
-                    )) => {
-                        silent_pings = silent_pings.saturating_add(1);
-                        if silent_pings >= LIVENESS_PING_STRIKES {
-                            warn!(index = context.device_index, "capture channel stopped delivering — restarting session on a fresh channel");
-                            return stop_for_current_publication(context.registry, context.shared);
-                        }
-                    }
-                    // Any reply — pong, feature error, unreachable-device
-                    // error — proves the channel still delivers.
-                    _ => silent_pings = 0,
+                    )) => PingOutcome::AllSilent,
+                    // A pong, feature error, or unsupported response all prove
+                    // that this channel still receives device replies.
+                    Ok(_)
+                    | Err(
+                        v20::Hidpp20Error::Feature(_)
+                        | v20::Hidpp20Error::UnsupportedResponse,
+                    ) => PingOutcome::Delivered,
+                    Err(_) => PingOutcome::ChannelFailed,
+                };
+                if liveness.finish_ping(
+                    tokio::time::Instant::now(),
+                    context.activity.generation(),
+                    outcome,
+                ) == LivenessDecision::Restart {
+                    warn!(index = context.device_index, "capture channel stopped delivering — restarting session on a fresh channel");
+                    return stop_for_current_publication(context.registry, context.shared);
                 }
             }
         }
@@ -692,23 +808,28 @@ async fn arm_controls_into(
         // Consume the getInfo error here, before the next await: Hidpp20Error
         // isn't Send, so holding it across an await would make this future
         // (spawned on tokio) non-Send.
-        let (supports_single_tap, resolution) = match tw.get_info().await {
-            Ok(twinfo) => (twinfo.supports_single_tap, twinfo.resolution),
+        let wheel_info = match tw.get_info().await {
+            Ok(twinfo) => Some(twinfo),
             Err(e) => {
                 warn!(error = ?e, "thumb wheel getInfo failed");
-                (false, WheelResolution::UNKNOWN)
+                None
             }
         };
         // Divert whenever capture was requested: rotation rebinds and the
         // sensitivity multiplier need the diverted event stream even on wheels
         // that report no single-tap capability (e.g. MX Master 4) — lacking the
         // tap only means a bound click can never fire.
-        if !supports_single_tap {
+        if wheel_info.is_some_and(|info| !info.supports_single_tap) {
             debug!("thumb wheel reports no single tap — click not capturable");
         }
-        armed.thumb = Some((tw, resolution));
-        if let Some((tw, _)) = armed.thumb.as_ref()
-            && let Err(error) = tw.divert(WheelDirection::Default).await
+        // Store ownership before the write: a transport error cannot prove
+        // whether firmware applied diversion, so rollback must cover it too.
+        armed.thumb = Some(ArmedThumbwheel {
+            wheel: tw,
+            info: wheel_info,
+        });
+        if let Some(thumb) = armed.thumb.as_ref()
+            && let Err(error) = thumb.wheel.divert(thumb.direction()).await
         {
             return Err(GestureError::Hidpp(format!("{error:?}")));
         }
