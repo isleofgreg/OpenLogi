@@ -26,7 +26,7 @@ use openlogi_hid::{
     ScrollResolution, SharedChannel, SmartShiftStatus, WriteError,
 };
 use tokio::time::error::Elapsed;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::receiver_access::ReceiverAccess;
 
@@ -317,6 +317,32 @@ pub fn reapply_mouse_volatile_in_background(
                     "host device I/O suspended — volatile reapply skipped"
                 );
                 return;
+            }
+            // A diverted wheel route at re-apply time is stale: the agent
+            // consumes no diverted wheel reports, and whichever process
+            // diverted the wheel is gone — this exact shape follows a killed
+            // agent, leaving vertical scrolling dead until something rewrites
+            // the mode. Reclaim native reporting before the config-driven
+            // write below, which deliberately preserves the route.
+            let reclaim = tokio::time::timeout(WRITE_BUDGET, async {
+                openlogi_hid::reclaim_native_wheel_route_on(&shared).await
+            })
+            .await;
+            match reclaim {
+                Ok(Ok(Some(mode))) => info!(
+                    index,
+                    ?mode,
+                    "wheel reports were diverted with no live consumer — restored native reporting"
+                ),
+                Ok(Ok(None)) => {}
+                Ok(Err(WriteError::FeatureUnsupported { .. })) => {
+                    debug!(index, "wheel route reclaim skipped — no HiResWheel feature");
+                }
+                Ok(Err(e)) => warn!(error = ?e, "native wheel route reclaim failed"),
+                Err(_) => warn!(
+                    index,
+                    "wheel route reclaim timed out (device asleep/unresponsive)"
+                ),
             }
             if resolution.is_some() || inverted.is_some() {
                 let result = tokio::time::timeout(WRITE_BUDGET, async {

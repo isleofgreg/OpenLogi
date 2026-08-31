@@ -211,6 +211,58 @@ pub async fn set_scroll_inversion_on(
     .map(|_| ())
 }
 
+/// Return the wheel to native HID reporting when its reports are currently
+/// diverted, preserving resolution and inversion. `Ok(None)` when the route
+/// was already native (nothing written).
+///
+/// This is the re-apply path's crash recovery: the agent never consumes
+/// diverted wheel reports (`DivertedRawWheel` notifications are dropped), so a
+/// diverted route found at reconnect/startup re-apply means whoever diverted
+/// it is gone — typically a killed process that never restored the mode — and
+/// every vertical wheel event is being reported into the void. Incremental
+/// config writes keep the preserve-the-route behavior of [`desired_mode`], so
+/// they cannot steal the route from a live external consumer mid-session.
+pub async fn reclaim_native_wheel_route_on(
+    shared: &SharedChannel,
+) -> Result<Option<ScrollWheelMode>, WriteError> {
+    let channel = shared.channel();
+    let index = shared.device_index();
+    let mut device = open_device(channel, index).await?;
+    let feature = open_feature::<HiResWheelFeature>(&mut device).await?;
+    let current = read_mode(&feature).await?;
+    let Some(desired) = reclaimed_native_mode(current) else {
+        return Ok(None);
+    };
+    let written = feature
+        .set_wheel_mode(
+            desired.target.into(),
+            resolution_to_hidpp(desired.resolution),
+            desired.inverted,
+        )
+        .await
+        .map_err(|error| {
+            classify_hidpp_error(error, HidppOperation::WriteWheelMode, HiResWheelFeature::ID)
+        })?;
+    validate_applied(written.try_into()?, desired)?;
+    let read_back = read_mode(&feature).await?;
+    validate_applied(read_back, desired)?;
+    debug!(
+        index,
+        ?read_back,
+        "diverted wheel route reclaimed to native"
+    );
+    Ok(Some(read_back))
+}
+
+/// The mode a stale diverted route should be rewritten to — `None` when the
+/// current route is already native.
+fn reclaimed_native_mode(current: ScrollWheelMode) -> Option<ScrollWheelMode> {
+    (current.target == ScrollReportingTarget::Diverted).then_some(ScrollWheelMode {
+        target: ScrollReportingTarget::Native,
+        ..current
+    })
+}
+
 async fn change_wheel_mode_on_channel(
     channel: &Arc<HidppChannel>,
     index: u8,
@@ -389,6 +441,25 @@ mod tests {
             target: ScrollReportingTarget::Diverted,
         };
         assert_eq!(desired_mode(current, None, Some(false)), current);
+    }
+
+    #[test]
+    fn stale_diverted_route_is_reclaimed_preserving_resolution_and_inversion() {
+        let current = ScrollWheelMode {
+            resolution: ScrollResolution::High,
+            inverted: true,
+            target: ScrollReportingTarget::Diverted,
+        };
+        assert_eq!(
+            reclaimed_native_mode(current),
+            Some(ScrollWheelMode::native(ScrollResolution::High, true))
+        );
+    }
+
+    #[test]
+    fn native_route_needs_no_reclaim() {
+        let current = ScrollWheelMode::native(ScrollResolution::Low, false);
+        assert_eq!(reclaimed_native_mode(current), None);
     }
 
     #[test]
