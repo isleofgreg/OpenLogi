@@ -147,6 +147,7 @@ async fn probe_bolt_receiver(
             identities.push(identity);
         }
     }
+    let identities = dedup_bolt_identities(identities);
 
     // Phase 2 — walk each occupied slot's feature table concurrently. Every walk
     // addresses its own device index, so responses route by index (no
@@ -327,15 +328,19 @@ async fn probe_unifying_receiver(
 /// (phase 1). Both reads address the receiver at index `0xff`, and the channel
 /// correlates responses by register — not by the slot encoded in the request
 /// payload — so they must be issued sequentially, never overlapped across slots.
-struct BoltSlotIdentity {
-    slot: u8,
-    codename: Option<String>,
+pub(super) struct BoltSlotIdentity {
+    pub(super) slot: u8,
+    pub(super) codename: Option<String>,
     /// Cache key from the pairing register's unit id. `None` = all-zero id
     /// (unidentifiable): don't cache; always probe when online.
-    id: Option<CacheKey>,
-    online: bool,
-    register_kind: DeviceKind,
-    wpid: Option<u16>,
+    pub(super) id: Option<CacheKey>,
+    pub(super) online: bool,
+    pub(super) register_kind: DeviceKind,
+    pub(super) wpid: Option<u16>,
+    /// Whether a live device-arrival event backed this sighting, or only the
+    /// pairing register answered. Event-backed sightings outrank register-only
+    /// ones when two slots claim the same unit id.
+    pub(super) has_event: bool,
 }
 
 /// Read one Bolt slot's identity from the receiver's pairing + codename
@@ -384,7 +389,60 @@ async fn read_bolt_slot_identity(
         online,
         register_kind: map_kind(bolt_kind),
         wpid,
+        has_event: event.is_some(),
     })
+}
+
+/// Drop phase-1 identities that duplicate another slot's unit id.
+///
+/// The receiver correlates pairing-register responses by register, not by the
+/// slot in the request payload, so concurrent HID++ traffic on the same
+/// receiver (a second process probing while the agent reconciles) can hand one
+/// slot's response to another slot's request. The result is a ghost: an extra
+/// "online" slot mirroring a real device's unit id while the pairing count
+/// still reports the true total. Left in, the ghost inherits the real
+/// device's cached probe through the shared cache key, soaks up doomed writes
+/// (`DeviceUnreachable`), wins one-shot CLI auto-selection, and leaks a
+/// phantom link into saved config. Keep the best-evidenced slot per unit id —
+/// an arrival event outranks a register-only sighting, then a codename read,
+/// then the lower slot for determinism. All-zero (`None`) ids are
+/// unidentifiable and never deduplicated.
+pub(super) fn dedup_bolt_identities(identities: Vec<BoltSlotIdentity>) -> Vec<BoltSlotIdentity> {
+    let mut kept: Vec<BoltSlotIdentity> = Vec::with_capacity(identities.len());
+    for identity in identities {
+        let duplicate = identity
+            .id
+            .is_some()
+            .then(|| kept.iter_mut().find(|k| k.id == identity.id))
+            .flatten();
+        let Some(existing) = duplicate else {
+            kept.push(identity);
+            continue;
+        };
+        // Phase 1 walks slots in ascending order, so on an evidence tie the
+        // earlier slot stays.
+        if evidence_rank(&identity) > evidence_rank(existing) {
+            warn!(
+                dropped_slot = existing.slot,
+                kept_slot = identity.slot,
+                "duplicate unit id across Bolt slots — dropping weaker sighting as a ghost"
+            );
+            *existing = identity;
+        } else {
+            warn!(
+                dropped_slot = identity.slot,
+                kept_slot = existing.slot,
+                "duplicate unit id across Bolt slots — dropping weaker sighting as a ghost"
+            );
+        }
+    }
+    kept.sort_by_key(|identity| identity.slot);
+    kept
+}
+
+/// Evidence strength of one slot sighting for [`dedup_bolt_identities`].
+fn evidence_rank(identity: &BoltSlotIdentity) -> u8 {
+    u8::from(identity.has_event) * 2 + u8::from(identity.codename.is_some())
 }
 
 /// Walk one identified Bolt slot's HID++ feature table (phase 2). Addresses the

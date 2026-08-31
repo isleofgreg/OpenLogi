@@ -16,8 +16,9 @@ use super::cache::{
 use super::events::EventFeatureIndices;
 use super::features::ProbedFeatures;
 use super::probe::{
-    NodeProbe, ProbeVerdict, assemble_bolt_probe, assemble_unifying_device,
-    parse_codename_unifying, preferred_direct_codename, probe_unifying_slot, unifying_probe_budget,
+    BoltSlotIdentity, NodeProbe, ProbeVerdict, assemble_bolt_probe, assemble_unifying_device,
+    dedup_bolt_identities, parse_codename_unifying, preferred_direct_codename, probe_unifying_slot,
+    unifying_probe_budget,
 };
 use super::{
     ChannelCache, Enumerator, ONESHOT_ATTEMPTS, OneShotScan, ScanPass, UNIFYING_CACHED_SLOT_PROBE,
@@ -790,4 +791,76 @@ async fn a_non_hidpp_node_leaves_the_tick_healthy() {
         "a node that is not HID++ is not a failure to retry"
     );
     assert!(complete, "nothing was left unchecked");
+}
+
+/// A phase-1 Bolt slot sighting for [`dedup_bolt_identities`] tests.
+fn bolt_identity(
+    slot: u8,
+    unit_id: Option<[u8; 4]>,
+    has_event: bool,
+    codename: Option<&str>,
+) -> BoltSlotIdentity {
+    BoltSlotIdentity {
+        slot,
+        codename: codename.map(str::to_string),
+        id: unit_id.map(|unit_id| CacheKey::Bolt { unit_id }),
+        online: true,
+        register_kind: DeviceKind::Mouse,
+        wpid: has_event.then_some(0xb042),
+        has_event,
+    }
+}
+
+fn identity_slots(identities: &[BoltSlotIdentity]) -> Vec<u8> {
+    identities.iter().map(|identity| identity.slot).collect()
+}
+
+#[test]
+fn register_only_ghost_of_an_event_backed_slot_is_dropped() {
+    // A receiver register cross-talk ghost: slot 3 mirrors slot 2's unit id
+    // but has no arrival event and no codename. Whichever order phase 1
+    // yields them, the event-backed sighting must win.
+    let unit = Some([0xd2, 0xc9, 0x3c, 0xc3]);
+    let real = || bolt_identity(2, unit, true, Some("MX Master 4 M"));
+    let ghost = || bolt_identity(3, unit, false, None);
+
+    let kept = dedup_bolt_identities(vec![real(), ghost()]);
+    assert_eq!(identity_slots(&kept), vec![2], "ghost after the real slot");
+
+    let kept = dedup_bolt_identities(vec![ghost(), real()]);
+    assert_eq!(identity_slots(&kept), vec![2], "ghost before the real slot");
+}
+
+#[test]
+fn tied_evidence_keeps_the_earlier_slot() {
+    let unit = Some([1, 2, 3, 4]);
+    let kept = dedup_bolt_identities(vec![
+        bolt_identity(1, unit, false, None),
+        bolt_identity(4, unit, false, None),
+    ]);
+    assert_eq!(
+        identity_slots(&kept),
+        vec![1],
+        "phase 1 is slot-ordered, so a tie keeps the first sighting"
+    );
+}
+
+#[test]
+fn distinct_unit_ids_are_untouched() {
+    let kept = dedup_bolt_identities(vec![
+        bolt_identity(1, Some([1, 1, 1, 1]), true, Some("a")),
+        bolt_identity(2, Some([2, 2, 2, 2]), true, Some("b")),
+    ]);
+    assert_eq!(identity_slots(&kept), vec![1, 2]);
+}
+
+#[test]
+fn unidentifiable_all_zero_ids_are_never_deduplicated() {
+    // `id: None` models the all-zero unit id; two such slots are two real
+    // (if unidentifiable) devices, not duplicates of each other.
+    let kept = dedup_bolt_identities(vec![
+        bolt_identity(1, None, false, None),
+        bolt_identity(2, None, false, None),
+    ]);
+    assert_eq!(identity_slots(&kept), vec![1, 2]);
 }
