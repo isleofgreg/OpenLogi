@@ -24,9 +24,9 @@ mod bolt;
 mod direct;
 mod unifying;
 
-#[cfg(test)]
-pub(super) use bolt::assemble_bolt_probe;
 use bolt::probe_bolt_receiver;
+#[cfg(test)]
+pub(super) use bolt::{BoltSlotIdentity, assemble_bolt_probe, dedup_bolt_identities};
 #[cfg(test)]
 pub(super) use direct::preferred_direct_codename;
 use direct::probe_direct;
