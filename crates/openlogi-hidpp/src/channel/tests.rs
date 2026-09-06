@@ -580,7 +580,7 @@ impl MockRawHidHandle {
             .push_back(raw_report(msg));
     }
 
-    async fn send_incoming(&self, msg: HidppMessage) {
+    pub(crate) async fn send_incoming(&self, msg: HidppMessage) {
         self.incoming_tx.send(raw_report(msg)).await.unwrap();
     }
 
