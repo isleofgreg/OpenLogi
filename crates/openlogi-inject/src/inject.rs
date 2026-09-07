@@ -393,13 +393,13 @@ pub fn post_scroll(delta: ScrollDelta) {
     }
 }
 
-/// Lifecycle phase of one synthetic smooth-scroll frame.
+/// Lifecycle phase of one synthetic scroll frame.
 ///
-/// Part of the runtime contract — the motion engine emits a balanced
-/// lifecycle — but no backend forwards it today: injected frames carry only
-/// distance. macOS deliberately posts *phaseless* continuous events (matching
-/// wheel semantics); stamping `kCGScrollWheelEventScrollPhase` instead
-/// declares a trackpad gesture, which enables rubber-band overscroll and
+/// The motion engine emits a balanced lifecycle for every stream. Only the
+/// gesture stream ([`post_gesture_scroll`]) forwards it: on macOS the phase
+/// lands in `kCGScrollWheelEventScrollPhase`, which declares a trackpad
+/// gesture. Wheel frames ([`post_smooth_scroll`]) stay deliberately
+/// *phaseless* — a phased main wheel enables rubber-band overscroll and
 /// WebKit gesture latching that breaks JS-scrolled sites. Linux and Windows
 /// have no equivalent field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -428,6 +428,31 @@ pub fn post_smooth_scroll(delta: ScrollDelta, phase: SmoothScrollPhase) {
     cfg_select! {
         target_os = "macos" => {
             macos::post_smooth_scroll(delta, phase);
+        }
+        _ => {
+            let _ = phase;
+            post_scroll(delta);
+        }
+    }
+}
+
+/// Synthesise one frame of a trackpad-style scroll gesture.
+///
+/// On macOS the frame is a continuous pixel event stamped with its scroll
+/// phase, so the stream reads as a two-finger swipe: swipe actions (row
+/// swipes in Reminders and Mail, Finder's column swipes) respond to it, where
+/// the phaseless wheel output of [`post_smooth_scroll`] only scrolls. A frame
+/// that quantizes to zero opens no gesture, and a terminal frame is posted
+/// even at zero distance so an open gesture always closes. Other platforms
+/// carry no phase and fall back to [`post_scroll`]. Non-finite distance is
+/// rejected at this I/O boundary.
+pub fn post_gesture_scroll(delta: ScrollDelta, phase: SmoothScrollPhase) {
+    if !delta.is_finite() {
+        return;
+    }
+    cfg_select! {
+        target_os = "macos" => {
+            macos::post_gesture_scroll(delta, phase);
         }
         _ => {
             let _ = phase;

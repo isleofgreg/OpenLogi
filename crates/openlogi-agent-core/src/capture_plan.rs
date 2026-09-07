@@ -63,6 +63,9 @@ pub struct DispatchPlan {
     /// This device's effective thumb-wheel sensitivity (device override or the
     /// app-wide default).
     pub thumbwheel_sensitivity: ThumbwheelSensitivity,
+    /// Whether this device's re-synthesised thumb-wheel scroll joins the
+    /// phased gesture stream (app-wide preference) or the phaseless wheel one.
+    pub thumbwheel_gesture_scroll: bool,
 }
 
 /// One device's independently versioned hardware target and dispatch plan.
@@ -193,6 +196,7 @@ pub fn plan_for_device(
             gesture_bindings,
             side_gesture_bindings,
             thumbwheel_sensitivity,
+            thumbwheel_gesture_scroll: config.app_settings.thumbwheel_gesture_scroll,
         },
     }
 }

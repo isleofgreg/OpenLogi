@@ -15,7 +15,7 @@ use openlogi_core::config::{
 use openlogi_core::scroll::ScrollDelta;
 use tracing::warn;
 
-use super::{MotionTuning, ScrollEngine, ScrollFrame, ScrollSource, WheelDelta};
+use super::{MotionTuning, ScrollEngine, ScrollFrame, ScrollSource, ScrollStream, WheelDelta};
 use crate::runtime::HidppSessionId;
 
 /// OS-hook callbacks must fail open rather than wait for the worker.
@@ -36,7 +36,7 @@ struct ScrollPreferenceSnapshot {
 }
 
 impl ScrollPreferenceSnapshot {
-    fn motion_tuning(self, source: &ScrollSource) -> MotionTuning {
+    fn motion_tuning(self, source: &ScrollSource, stream: ScrollStream) -> MotionTuning {
         let preaccelerated = os_hook_input_is_preaccelerated(source);
         MotionTuning {
             step: self.tuning.step.multiplier(),
@@ -47,6 +47,7 @@ impl ScrollPreferenceSnapshot {
                 self.tuning.acceleration.max_gain()
             },
             preaccelerated,
+            hold: MotionTuning::hold_for(stream),
         }
     }
 }
@@ -165,6 +166,7 @@ enum ScrollOutputMode {
 struct ScrollInput {
     generation: u64,
     source: ScrollSource,
+    stream: ScrollStream,
     impulse: WheelDelta,
     output: ScrollOutputMode,
 }
@@ -277,16 +279,33 @@ impl ScrollInputHandle {
         } else {
             return false;
         };
-        self.try_enqueue(ScrollSource::current_hook(), scaled, output)
+        self.try_enqueue(
+            ScrollSource::current_hook(),
+            ScrollStream::Wheel,
+            scaled,
+            output,
+        )
     }
 
-    /// Queue one diverted thumb-wheel impulse from an active HID++ session.
+    /// Queue one diverted thumb-wheel impulse from an active HID++ session,
+    /// bound for `stream`.
     ///
     /// Rejection tells the already-diverted caller to inject the distance
     /// directly; unlike an OS hook, there is no physical event to pass through.
+    /// Wheel-stream input is only worth queuing while smoothing is on; gesture
+    /// input is always queued, since only the worker can own its lifecycle —
+    /// with smoothing off it lands direct, just phased.
     #[must_use]
-    pub(crate) fn try_hidpp_scroll(&self, session: &HidppSessionId, delta: ScrollDelta) -> bool {
-        if !self.accepting.load(Ordering::Acquire) || !self.preferences.smooth_scroll_enabled() {
+    pub(crate) fn try_hidpp_scroll(
+        &self,
+        session: &HidppSessionId,
+        delta: ScrollDelta,
+        stream: ScrollStream,
+    ) -> bool {
+        if !self.accepting.load(Ordering::Acquire) {
+            return false;
+        }
+        if stream == ScrollStream::Wheel && !self.preferences.smooth_scroll_enabled() {
             return false;
         }
         let Ok(impulse) = WheelDelta::try_from(delta) else {
@@ -294,6 +313,7 @@ impl ScrollInputHandle {
         };
         self.try_enqueue(
             ScrollSource::Hidpp(session.clone()),
+            stream,
             impulse,
             ScrollOutputMode::Smooth { at: Instant::now() },
         )
@@ -302,12 +322,14 @@ impl ScrollInputHandle {
     fn try_enqueue(
         &self,
         source: ScrollSource,
+        stream: ScrollStream,
         impulse: WheelDelta,
         output: ScrollOutputMode,
     ) -> bool {
         let input = ScrollInput {
             generation: self.generation.load(Ordering::Acquire),
             source,
+            stream,
             impulse,
             output,
         };
@@ -500,7 +522,9 @@ fn run_worker(
             // can no longer protect anything. A delayed old-generation control
             // is also ignored above instead of recreating it.
         } else if !preferences.smooth_scroll_enabled() {
-            engine.cancel_all(emit_smooth);
+            // Gesture motions outlive the preference: they only ever needed
+            // the worker for their lifecycle, not for the animation.
+            engine.cancel_stream(ScrollStream::Wheel, emit_smooth);
         }
 
         let command = engine.next_deadline().map_or_else(
@@ -515,15 +539,29 @@ fn run_worker(
             Ok(ScrollCommand::Input(input)) if cancellations.accepts(&input) => {
                 let snapshot = preferences.load();
                 match input.output {
-                    ScrollOutputMode::Smooth { at } if snapshot.smooth_scroll => {
-                        let tuning = snapshot.motion_tuning(&input.source);
+                    ScrollOutputMode::Smooth { at }
+                        if snapshot.smooth_scroll || input.stream == ScrollStream::Gesture =>
+                    {
+                        let tuning = if snapshot.smooth_scroll {
+                            snapshot.motion_tuning(&input.source, input.stream)
+                        } else {
+                            MotionTuning::direct_gesture()
+                        };
                         tracing::trace!(
                             x = input.impulse.x,
                             y = input.impulse.y,
+                            stream = ?input.stream,
                             queued_us = at.elapsed().as_micros(),
                             "smooth wheel impulse"
                         );
-                        engine.impulse(input.source, input.impulse, at, tuning, emit_smooth);
+                        engine.impulse(
+                            input.source,
+                            input.stream,
+                            input.impulse,
+                            at,
+                            tuning,
+                            emit_smooth,
+                        );
                     }
                     ScrollOutputMode::Direct => {
                         engine.cancel_source(&input.source, emit_smooth);
@@ -588,13 +626,20 @@ mod tests {
         let hook = ScrollSource::OsHook(thread::current().id());
         let hidpp = ScrollSource::Hidpp(HidppSessionId::with_epoch("mouse-a", 1));
 
-        let hook_gain = snapshot.motion_tuning(&hook).max_gain;
+        let hook_gain = snapshot.motion_tuning(&hook, ScrollStream::Wheel).max_gain;
         if cfg!(target_os = "macos") {
             assert!((hook_gain - 1.0).abs() < f64::EPSILON);
         } else {
             assert!((hook_gain - configured).abs() < f64::EPSILON);
         }
-        assert!((snapshot.motion_tuning(&hidpp).max_gain - configured).abs() < f64::EPSILON);
+        assert!(
+            (snapshot.motion_tuning(&hidpp, ScrollStream::Wheel).max_gain - configured).abs()
+                < f64::EPSILON
+        );
+        assert_eq!(
+            snapshot.motion_tuning(&hidpp, ScrollStream::Gesture).hold,
+            super::super::GESTURE_HOLD
+        );
     }
 
     #[test]
@@ -689,7 +734,11 @@ mod tests {
     fn hidpp_smoothing_does_not_apply_main_wheel_sensitivity() {
         let (input, receiver, _controls) = standalone_input(1, preferences(true, 7));
         let session = HidppSessionId::with_epoch("mouse-a", 7);
-        assert!(input.try_hidpp_scroll(&session, ScrollDelta::wheel_ticks(0.0, 2.0)));
+        assert!(input.try_hidpp_scroll(
+            &session,
+            ScrollDelta::wheel_ticks(0.0, 2.0),
+            ScrollStream::Wheel
+        ));
 
         let queued = queued_input(&receiver);
         assert_eq!(queued.impulse, WheelDelta { x: 0.0, y: 2.0 });
@@ -737,8 +786,16 @@ mod tests {
         let (input, commands, controls) = standalone_input(2, Arc::clone(&preferences));
         let cancelled = HidppSessionId::with_epoch("mouse-a", 7);
         let survivor = HidppSessionId::with_epoch("mouse-b", 3);
-        assert!(input.try_hidpp_scroll(&cancelled, ScrollDelta::wheel_ticks(1.0, 0.0)));
-        assert!(input.try_hidpp_scroll(&survivor, ScrollDelta::wheel_ticks(0.0, 1.0)));
+        assert!(input.try_hidpp_scroll(
+            &cancelled,
+            ScrollDelta::wheel_ticks(1.0, 0.0),
+            ScrollStream::Wheel
+        ));
+        assert!(input.try_hidpp_scroll(
+            &survivor,
+            ScrollDelta::wheel_ticks(0.0, 1.0),
+            ScrollStream::Wheel
+        ));
 
         input.cancel_hidpp_session(&cancelled);
         assert_eq!(
@@ -802,6 +859,7 @@ mod tests {
         let input = |session: &HidppSessionId, generation| ScrollInput {
             generation,
             source: ScrollSource::Hidpp(session.clone()),
+            stream: ScrollStream::Wheel,
             impulse: WheelDelta { x: 0.0, y: 1.0 },
             output: ScrollOutputMode::Direct,
         };
@@ -857,6 +915,7 @@ mod tests {
             .send(ScrollCommand::Input(ScrollInput {
                 generation: 1,
                 source: ScrollSource::Hidpp(session.clone()),
+                stream: ScrollStream::Wheel,
                 impulse: WheelDelta { x: 0.0, y: 1.0 },
                 output: ScrollOutputMode::Smooth { at: Instant::now() },
             }))

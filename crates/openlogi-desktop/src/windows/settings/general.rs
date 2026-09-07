@@ -27,6 +27,7 @@ pub(super) fn general_page(
     } = sliders;
     let group = SettingGroup::new()
         .item(smooth_scrolling_item())
+        .items(cfg!(target_os = "macos").then(thumbwheel_gesture_scroll_item))
         .item(
             SettingItem::new(
                 tr!("Vertical Scroll Sensitivity"),
@@ -115,6 +116,28 @@ fn smooth_scrolling_item() -> SettingItem {
     )
     .description(tr!(
         "Animate traditional mouse-wheel input while leaving trackpad scrolling unchanged."
+    ))
+}
+
+/// The thumb-wheel gesture switch: macOS only, since it is the scroll phase
+/// that turns the wheel's output into a swipe and no other platform has one.
+fn thumbwheel_gesture_scroll_item() -> SettingItem {
+    SettingItem::new(
+        tr!("Thumb wheel swipes"),
+        SettingField::switch(
+            |cx| {
+                AppState::try_read(cx).is_some_and(|s| s.app_settings().thumbwheel_gesture_scroll)
+            },
+            |enabled, cx| {
+                AppState::update(cx, move |state, cx| {
+                    state.set_thumbwheel_gesture_scroll(enabled);
+                    cx.emit(StateEvent::SettingsChanged);
+                });
+            },
+        ),
+    )
+    .description(tr!(
+        "Scroll the thumb wheel as a trackpad gesture so swipe actions respond, such as swiping a reminder or a message to reveal Delete."
     ))
 }
 

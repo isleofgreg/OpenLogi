@@ -25,6 +25,34 @@ static PIXEL_SCROLL_QUANTIZER: LazyLock<Mutex<ScrollQuantizer>> =
     LazyLock::new(|| Mutex::new(ScrollQuantizer::default()));
 static SMOOTH_SCROLL_QUANTIZER: LazyLock<Mutex<ScrollQuantizer>> =
     LazyLock::new(|| Mutex::new(ScrollQuantizer::default()));
+static GESTURE_SCROLL_OUTPUT: LazyLock<Mutex<GestureOutput>> =
+    LazyLock::new(|| Mutex::new(GestureOutput::default()));
+
+/// Points one wheel tick becomes in continuous output — the line/point
+/// relationship native continuous events carry.
+const POINTS_PER_WHEEL_TICK: f64 = 10.0;
+
+// Phase fields aren't exposed by core-graphics 0.25; the raw ids come from
+// `CGEventTypes.h`.
+const SCROLL_WHEEL_EVENT_SCROLL_PHASE: u32 = 99; // kCGScrollWheelEventScrollPhase
+const SCROLL_WHEEL_EVENT_MOMENTUM_PHASE: u32 = 123; // kCGScrollWheelEventMomentumPhase
+
+/// `NSEventPhase` bits as they appear in `kCGScrollWheelEventScrollPhase`.
+const SCROLL_PHASE_BEGAN: i64 = 1;
+const SCROLL_PHASE_CHANGED: i64 = 4;
+const SCROLL_PHASE_ENDED: i64 = 8;
+const SCROLL_PHASE_CANCELLED: i64 = 16;
+
+/// Gesture-stream output state: the fractional residual plus whether a
+/// phased stream is open at the OS. The engine's lifecycle is balanced in
+/// wheel units, but quantization can round its first frame to nothing — so
+/// the OS-visible gesture opens on the first frame that posts a distance and
+/// closes on the engine's terminal frame, distance or not.
+#[derive(Default)]
+struct GestureOutput {
+    quantizer: ScrollQuantizer,
+    open: bool,
+}
 
 // NX_KEYTYPE_* constants from <IOKit/hidsystem/ev_keymap.h>.
 const NX_KEYTYPE_SOUND_UP: i32 = 0;
@@ -645,8 +673,6 @@ pub(super) fn post_scroll(delta: ScrollDelta) {
 }
 
 pub(super) fn post_smooth_scroll(delta: ScrollDelta, _phase: SmoothScrollPhase) {
-    const POINTS_PER_WHEEL_TICK: f64 = 10.0;
-
     let units_per_input = match delta {
         ScrollDelta::Pixels { .. } => 1.0,
         ScrollDelta::WheelTicks { .. } => POINTS_PER_WHEEL_TICK,
@@ -681,6 +707,64 @@ pub(super) fn post_smooth_scroll(delta: ScrollDelta, _phase: SmoothScrollPhase) 
     // WebKit's gesture latching can starve sites that scroll from JS wheel
     // handlers).
     set_continuous_scroll_fields(&ev, delta);
+    tag_synthetic(&ev);
+    ev.post(CGEventTapLocation::HID);
+}
+
+/// Post one frame of the phased gesture stream. Unlike [`post_smooth_scroll`]
+/// the phase is stamped: `Began` on the first frame that carries a distance,
+/// `Changed` while the gesture is open, and the terminal `Ended`/`Cancelled`
+/// whenever one is open — with a zero distance if that is all the frame
+/// has, since the OS needs the close more than the last sub-pixel.
+pub(super) fn post_gesture_scroll(delta: ScrollDelta, phase: SmoothScrollPhase) {
+    let units_per_input = match delta {
+        ScrollDelta::Pixels { .. } => 1.0,
+        ScrollDelta::WheelTicks { .. } => POINTS_PER_WHEEL_TICK,
+    };
+    let Ok(mut output) = GESTURE_SCROLL_OUTPUT.lock() else {
+        tracing::warn!("macOS gesture-scroll output mutex poisoned");
+        return;
+    };
+    let quantized = output.quantizer.quantize(delta, units_per_input);
+    let phase_value = match phase {
+        SmoothScrollPhase::Ended | SmoothScrollPhase::Cancelled => {
+            // A gesture's residual dies with it: the next one starts exact.
+            let was_open = std::mem::take(&mut *output).open;
+            if !was_open {
+                return;
+            }
+            if phase == SmoothScrollPhase::Cancelled {
+                SCROLL_PHASE_CANCELLED
+            } else {
+                SCROLL_PHASE_ENDED
+            }
+        }
+        SmoothScrollPhase::Began | SmoothScrollPhase::Changed => {
+            if quantized == QuantizedScroll::default() {
+                return;
+            }
+            if std::mem::replace(&mut output.open, true) {
+                SCROLL_PHASE_CHANGED
+            } else {
+                SCROLL_PHASE_BEGAN
+            }
+        }
+    };
+    drop(output);
+
+    let Ok(src) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+        tracing::warn!("CGEventSource::new failed for gesture scroll");
+        return;
+    };
+    let Ok(ev) =
+        CGEvent::new_scroll_event(src, ScrollEventUnit::PIXEL, 2, quantized.y, quantized.x, 0)
+    else {
+        tracing::warn!("CGEvent::new_scroll_event failed for gesture scroll");
+        return;
+    };
+    set_continuous_scroll_fields(&ev, quantized);
+    ev.set_integer_value_field(SCROLL_WHEEL_EVENT_SCROLL_PHASE, phase_value);
+    ev.set_integer_value_field(SCROLL_WHEEL_EVENT_MOMENTUM_PHASE, 0);
     tag_synthetic(&ev);
     ev.post(CGEventTapLocation::HID);
 }

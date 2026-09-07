@@ -5,10 +5,26 @@
 //! evaluates finite smooth motion from absolute timestamps. Pixel-precise input
 //! never enters this runtime, so native trackpad and continuous wheel streams
 //! cannot be mixed with wheel ticks.
+//!
+//! Output leaves through one of two application-visible streams
+//! ([`ScrollStream`]): the phaseless wheel stream every mouse wheel joins,
+//! and the phased gesture stream a diverted thumb wheel joins so its rolls
+//! read as trackpad swipes. Each stream keeps its own balanced lifecycle.
 
 mod worker;
 
 pub use worker::{ScrollInputHandle, ScrollPreferences, ScrollRuntime};
+
+/// Which application-visible stream a source's distances join.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollStream {
+    /// Phaseless wheel output: scrolls everywhere a wheel does, never starts
+    /// a swipe.
+    Wheel,
+    /// Trackpad-style gesture output: a phased Began/Changed/Ended stream
+    /// that swipe actions recognise. Joined by the diverted thumb wheel.
+    Gesture,
+}
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
@@ -27,6 +43,12 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(8);
 /// wheel rate for acceleration. Sized so a notched wheel emitting one full
 /// tick every `dt < ACCEL_WINDOW` reproduces the classic per-interval gain.
 const ACCEL_WINDOW: Duration = Duration::from_millis(70);
+/// How long a gesture source stays open after its motion settles, so one
+/// roll of the thumb wheel is one gesture: the terminal phase waits for the
+/// wheel to actually stop rather than for each tick's own animation. The
+/// wheel's diverted reports arrive at most a few tens of milliseconds apart
+/// while it turns, so a gap this long is a released wheel.
+const GESTURE_HOLD: Duration = Duration::from_millis(150);
 /// Numerator of the tick-rate acceleration curve, in milliseconds: a source
 /// whose window holds one tick per `dt` ms gains `(1 + ACCEL_RATE_MS/dt) / 2`,
 /// clamped between 1 and the configured cap.
@@ -111,6 +133,33 @@ pub(crate) struct MotionTuning {
     /// direction flip, so opposing ticks get a cold start re-imposed via
     /// [`ReversalCooldown`].
     pub(crate) preaccelerated: bool,
+    /// How long the source stays active after its last pulse settles, holding
+    /// its stream's terminal phase back. Zero for wheel output, whose phase
+    /// is never forwarded.
+    pub(crate) hold: Duration,
+}
+
+impl MotionTuning {
+    /// The gesture stream with smoothing off: each tick lands in full on the
+    /// next frame, unscaled, and only the hold keeps the gesture open.
+    pub(crate) fn direct_gesture() -> Self {
+        Self {
+            step: 1.0,
+            duration: FRAME_INTERVAL,
+            max_gain: 1.0,
+            preaccelerated: false,
+            hold: GESTURE_HOLD,
+        }
+    }
+
+    /// The stream's hold: a gesture waits [`GESTURE_HOLD`] for the wheel to
+    /// stop; a wheel stream has no phase to hold back.
+    pub(crate) fn hold_for(stream: ScrollStream) -> Duration {
+        match stream {
+            ScrollStream::Wheel => Duration::ZERO,
+            ScrollStream::Gesture => GESTURE_HOLD,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -182,17 +231,29 @@ impl From<WheelDelta> for ScrollDelta {
 /// One output frame from the pure motion model.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ScrollFrame {
+    stream: ScrollStream,
     delta: WheelDelta,
     phase: SmoothScrollPhase,
 }
 
 impl ScrollFrame {
-    fn new(delta: WheelDelta, phase: SmoothScrollPhase) -> Self {
-        Self { delta, phase }
+    fn new(stream: ScrollStream, delta: WheelDelta, phase: SmoothScrollPhase) -> Self {
+        Self {
+            stream,
+            delta,
+            phase,
+        }
     }
 
     fn post(self) {
-        openlogi_inject::post_smooth_scroll(self.delta.into(), self.phase);
+        match self.stream {
+            ScrollStream::Wheel => {
+                openlogi_inject::post_smooth_scroll(self.delta.into(), self.phase);
+            }
+            ScrollStream::Gesture => {
+                openlogi_inject::post_gesture_scroll(self.delta.into(), self.phase);
+            }
+        }
     }
 }
 
@@ -357,7 +418,13 @@ impl ReversalCooldown {
 /// of a flick, and a finite pulse set already bounds how long any direction
 /// change takes to win.
 struct ActiveMotion {
+    /// The stream this source's distances join, fixed at its first tick.
+    stream: ScrollStream,
     pulses: Vec<Pulse>,
+    /// Arrival of the most recent tick, from which the hold is measured.
+    last_tick_at: Instant,
+    /// How long past `last_tick_at` the source stays active with no pulses.
+    hold: Duration,
     /// Sum of completed pulses' full amplitudes, so pruning never moves the
     /// position.
     settled: WheelDelta,
@@ -371,9 +438,12 @@ struct ActiveMotion {
 }
 
 impl ActiveMotion {
-    fn new(impulse: WheelDelta, at: Instant, tuning: MotionTuning) -> Self {
+    fn new(stream: ScrollStream, impulse: WheelDelta, at: Instant, tuning: MotionTuning) -> Self {
         let mut motion = Self {
+            stream,
             pulses: Vec::new(),
+            last_tick_at: at,
+            hold: tuning.hold,
             settled: WheelDelta::ZERO,
             emitted: WheelDelta::ZERO,
             next_frame: at + FRAME_INTERVAL,
@@ -433,6 +503,8 @@ impl ActiveMotion {
 
     /// Superpose one tick's pulse and evaluate the position at its timestamp.
     fn add_tick(&mut self, impulse: WheelDelta, at: Instant, tuning: MotionTuning) -> MotionUpdate {
+        self.last_tick_at = at;
+        self.hold = tuning.hold;
         let impulse = self.cooled(impulse, at, tuning);
         let gain = self.windowed_gain(impulse, at, tuning.max_gain);
         let amplitude = impulse.scale(tuning.step * gain);
@@ -470,9 +542,7 @@ impl ActiveMotion {
             while self.next_frame <= at {
                 self.next_frame += FRAME_INTERVAL;
             }
-            if let Some(ends_at) = self.ends_at() {
-                self.next_frame = self.next_frame.min(ends_at);
-            }
+            self.next_frame = self.next_frame.min(self.ends_at());
         }
         update
     }
@@ -481,11 +551,16 @@ impl ActiveMotion {
         let position = self.position_at(at);
         let delta = self.delta_to(position);
         self.prune(at);
-        if self.pulses.is_empty() {
+        if self.pulses.is_empty() && at >= self.held_until() {
             MotionUpdate::Finished(delta)
         } else {
             MotionUpdate::Active(delta)
         }
+    }
+
+    /// When the hold after the last tick lapses.
+    fn held_until(&self) -> Instant {
+        self.last_tick_at + self.hold
     }
 
     fn position_at(&self, at: Instant) -> WheelDelta {
@@ -505,8 +580,15 @@ impl ActiveMotion {
         });
     }
 
-    fn ends_at(&self) -> Option<Instant> {
-        self.pulses.iter().map(Pulse::ends_at).max()
+    /// When the source can finish: its last pulse's end or the hold's lapse,
+    /// whichever is later.
+    fn ends_at(&self) -> Instant {
+        let held_until = self.held_until();
+        self.pulses
+            .iter()
+            .map(Pulse::ends_at)
+            .max()
+            .map_or(held_until, |ends_at| ends_at.max(held_until))
     }
 
     fn delta_to(&mut self, position: WheelDelta) -> WheelDelta {
@@ -529,73 +611,108 @@ impl MotionUpdate {
     }
 }
 
-/// The one phase stream visible to the foreground application. Source-local
+/// One phase stream visible to the foreground application. Source-local
 /// motions may overlap, but Core Graphics has no source identity with which to
-/// pair multiple synthetic gestures; all distances therefore share this single
-/// balanced lifecycle.
-#[derive(Default)]
-enum OutputStream {
-    #[default]
-    Idle,
-    Active,
+/// pair multiple synthetic gestures; all distances bound for one
+/// [`ScrollStream`] therefore share that stream's single balanced lifecycle.
+struct OutputStream {
+    stream: ScrollStream,
+    active: bool,
 }
 
 impl OutputStream {
+    const fn new(stream: ScrollStream) -> Self {
+        Self {
+            stream,
+            active: false,
+        }
+    }
+
     fn progress(&mut self, delta: WheelDelta, emit: &mut impl FnMut(ScrollFrame)) {
         if delta.is_zero() {
             return;
         }
-        let phase = match self {
-            Self::Idle => {
-                *self = Self::Active;
-                SmoothScrollPhase::Began
-            }
-            Self::Active => SmoothScrollPhase::Changed,
+        let phase = if std::mem::replace(&mut self.active, true) {
+            SmoothScrollPhase::Changed
+        } else {
+            SmoothScrollPhase::Began
         };
-        emit(ScrollFrame::new(delta, phase));
+        emit(ScrollFrame::new(self.stream, delta, phase));
     }
 
     fn finish(&mut self, delta: WheelDelta, emit: &mut impl FnMut(ScrollFrame)) {
-        match self {
-            Self::Idle if !delta.is_zero() => {
-                emit(ScrollFrame::new(delta, SmoothScrollPhase::Began));
-                emit(ScrollFrame::new(WheelDelta::ZERO, SmoothScrollPhase::Ended));
-            }
-            Self::Active => emit(ScrollFrame::new(delta, SmoothScrollPhase::Ended)),
-            Self::Idle => {}
+        if self.active {
+            emit(ScrollFrame::new(
+                self.stream,
+                delta,
+                SmoothScrollPhase::Ended,
+            ));
+        } else if !delta.is_zero() {
+            emit(ScrollFrame::new(
+                self.stream,
+                delta,
+                SmoothScrollPhase::Began,
+            ));
+            emit(ScrollFrame::new(
+                self.stream,
+                WheelDelta::ZERO,
+                SmoothScrollPhase::Ended,
+            ));
         }
-        *self = Self::Idle;
+        self.active = false;
     }
 
     fn cancel(&mut self, emit: &mut impl FnMut(ScrollFrame)) {
-        if matches!(self, Self::Active) {
+        if self.active {
             emit(ScrollFrame::new(
+                self.stream,
                 WheelDelta::ZERO,
                 SmoothScrollPhase::Cancelled,
             ));
         }
-        *self = Self::Idle;
+        self.active = false;
     }
 }
 
 /// Pure per-source state machine. Absence from the map represents idle, so an
-/// idle source cannot accidentally retain a target or scheduled deadline. All
-/// source-local distances feed one application-visible [`OutputStream`].
-#[derive(Default)]
+/// idle source cannot accidentally retain a target or scheduled deadline. Each
+/// source-local motion feeds the application-visible [`OutputStream`] of the
+/// [`ScrollStream`] it was admitted to.
 struct ScrollEngine {
     active: HashMap<ScrollSource, ActiveMotion>,
-    output: OutputStream,
+    wheel_output: OutputStream,
+    gesture_output: OutputStream,
+}
+
+impl Default for ScrollEngine {
+    fn default() -> Self {
+        Self {
+            active: HashMap::new(),
+            wheel_output: OutputStream::new(ScrollStream::Wheel),
+            gesture_output: OutputStream::new(ScrollStream::Gesture),
+        }
+    }
 }
 
 impl ScrollEngine {
     fn impulse(
         &mut self,
         source: ScrollSource,
+        stream: ScrollStream,
         impulse: WheelDelta,
         at: Instant,
         tuning: MotionTuning,
         emit: &mut impl FnMut(ScrollFrame),
     ) {
+        // A source changing streams (the gesture preference toggled under a
+        // live session) closes its old lifecycle before opening the new one.
+        if self
+            .active
+            .get(&source)
+            .is_some_and(|motion| motion.stream != stream)
+        {
+            self.cancel_source(&source, emit);
+        }
         let update = match self.active.entry(source) {
             Entry::Occupied(mut entry) => {
                 let update = entry.get_mut().add_tick(impulse, at, tuning);
@@ -605,13 +722,24 @@ impl ScrollEngine {
                 Some(update)
             }
             Entry::Vacant(entry) => {
-                entry.insert(ActiveMotion::new(impulse, at, tuning));
+                entry.insert(ActiveMotion::new(stream, impulse, at, tuning));
                 None
             }
         };
         if let Some(update) = update {
-            self.emit_update(update, emit);
+            self.emit_update(stream, update, emit);
         }
+    }
+
+    fn output(&mut self, stream: ScrollStream) -> &mut OutputStream {
+        match stream {
+            ScrollStream::Wheel => &mut self.wheel_output,
+            ScrollStream::Gesture => &mut self.gesture_output,
+        }
+    }
+
+    fn has_active(&self, stream: ScrollStream) -> bool {
+        self.active.values().any(|motion| motion.stream == stream)
     }
 
     fn advance_due(&mut self, at: Instant, emit: &mut impl FnMut(ScrollFrame)) {
@@ -622,17 +750,17 @@ impl ScrollEngine {
             .map(|(source, _)| source.clone())
             .collect();
         for source in due {
-            let Some(update) = self
+            let Some((stream, update)) = self
                 .active
                 .get_mut(&source)
-                .map(|motion| motion.advance(at))
+                .map(|motion| (motion.stream, motion.advance(at)))
             else {
                 continue;
             };
             if update.is_finished() {
                 self.active.remove(&source);
             }
-            self.emit_update(update, emit);
+            self.emit_update(stream, update, emit);
         }
     }
 
@@ -641,23 +769,37 @@ impl ScrollEngine {
     }
 
     fn cancel_source(&mut self, source: &ScrollSource, emit: &mut impl FnMut(ScrollFrame)) {
-        if self.active.remove(source).is_some() && self.active.is_empty() {
-            self.output.cancel(emit);
+        if let Some(motion) = self.active.remove(source)
+            && !self.has_active(motion.stream)
+        {
+            self.output(motion.stream).cancel(emit);
         }
+    }
+
+    /// Drop every source bound for `stream` and cancel its output.
+    fn cancel_stream(&mut self, stream: ScrollStream, emit: &mut impl FnMut(ScrollFrame)) {
+        self.active.retain(|_, motion| motion.stream != stream);
+        self.output(stream).cancel(emit);
     }
 
     fn cancel_all(&mut self, emit: &mut impl FnMut(ScrollFrame)) {
         self.active.clear();
-        self.output.cancel(emit);
+        self.wheel_output.cancel(emit);
+        self.gesture_output.cancel(emit);
     }
 
-    fn emit_update(&mut self, update: MotionUpdate, emit: &mut impl FnMut(ScrollFrame)) {
+    fn emit_update(
+        &mut self,
+        stream: ScrollStream,
+        update: MotionUpdate,
+        emit: &mut impl FnMut(ScrollFrame),
+    ) {
         match update {
-            MotionUpdate::Finished(delta) if self.active.is_empty() => {
-                self.output.finish(delta, emit);
+            MotionUpdate::Finished(delta) if !self.has_active(stream) => {
+                self.output(stream).finish(delta, emit);
             }
             MotionUpdate::Active(delta) | MotionUpdate::Finished(delta) => {
-                self.output.progress(delta, emit);
+                self.output(stream).progress(delta, emit);
             }
         }
     }

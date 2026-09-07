@@ -268,6 +268,15 @@ pub struct AppSettings {
     /// only diverted from native scrolling once this leaves the default.
     #[serde(default)]
     pub thumbwheel_sensitivity: ThumbwheelSensitivity,
+    /// Whether a diverted thumb wheel's continuous scroll is posted as a
+    /// trackpad-style gesture — one Began/Changed/Ended phased stream per
+    /// roll — instead of phaseless wheel events. Swipe actions only answer a
+    /// phased stream (row swipes in Reminders and Mail, Finder's column
+    /// swipes), which is how the vendor software drives the thumb wheel;
+    /// phaseless events scroll everywhere a wheel does but never start a
+    /// swipe. On by default. macOS only: other platforms carry no phase.
+    #[serde(default = "default_true")]
+    pub thumbwheel_gesture_scroll: bool,
     /// Light/dark appearance preference. Defaults to following the OS.
     #[serde(default)]
     pub appearance: Appearance,
@@ -675,6 +684,7 @@ impl Default for AppSettings {
             asset_source: AssetSourcePreference::Automatic,
             language: None,
             thumbwheel_sensitivity: ThumbwheelSensitivity::DEFAULT,
+            thumbwheel_gesture_scroll: true,
             appearance: Appearance::System,
             ui_scale: UiScale::Normal,
             device_view_mode: DeviceViewMode::Grid,
@@ -688,8 +698,9 @@ impl Default for AppSettings {
 
 /// serde default for the on-by-default [`AppSettings`] toggles
 /// ([`AppSettings::show_in_menu_bar`], [`AppSettings::capture_mouse_events`],
-/// [`AppSettings::auto_download_assets`]), so configs predating a field keep the
-/// out-of-the-box behavior.
+/// [`AppSettings::auto_download_assets`],
+/// [`AppSettings::thumbwheel_gesture_scroll`]), so configs predating a field
+/// keep the out-of-the-box behavior.
 fn default_true() -> bool {
     true
 }

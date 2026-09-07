@@ -26,6 +26,7 @@ fn tuning(step: f64, duration_ms: u64, max_gain: f64) -> MotionTuning {
         duration: Duration::from_millis(duration_ms),
         max_gain,
         preaccelerated: false,
+        hold: Duration::ZERO,
     }
 }
 
@@ -128,6 +129,7 @@ fn synthetic_ratchet_tick_travels_step_distance_and_finishes_exactly() {
     let mut frames = Vec::new();
     engine.impulse(
         source(),
+        ScrollStream::Wheel,
         wheel(0.0, 1.0),
         base,
         tuning(3.0, 100, 1.0),
@@ -169,6 +171,7 @@ fn synthetic_burst_superposes_and_conserves_scaled_input() {
     for (millis, delta) in [(0, 0.25), (10, 0.25), (20, 0.25)] {
         engine.impulse(
             source(),
+            ScrollStream::Wheel,
             wheel(0.0, delta),
             base + Duration::from_millis(millis),
             tuning(2.0, 100, 1.0),
@@ -194,6 +197,7 @@ fn synthetic_fast_ticks_gain_amplitude_deterministically() {
     for millis in (0..=70).step_by(10) {
         engine.impulse(
             source(),
+            ScrollStream::Wheel,
             wheel(0.0, 1.0),
             base + Duration::from_millis(millis),
             tuning(1.0, 100, 7.0),
@@ -221,6 +225,7 @@ fn synthetic_frame_interval_ticks_coalesce_and_cap_at_max_gain() {
     for tick in 0..40 {
         engine.impulse(
             source(),
+            ScrollStream::Wheel,
             wheel(0.0, 1.0),
             base + Duration::from_micros(tick * 400),
             tuning(1.0, 100, 7.0),
@@ -251,11 +256,19 @@ fn synthetic_reversal_superposes_and_conserves_net_input() {
     let base = Instant::now();
     let mut engine = ScrollEngine::default();
     let mut frames = Vec::new();
-    engine.impulse(source(), wheel(0.0, 1.0), base, neutral(), &mut |frame| {
-        frames.push(frame);
-    });
     engine.impulse(
         source(),
+        ScrollStream::Wheel,
+        wheel(0.0, 1.0),
+        base,
+        neutral(),
+        &mut |frame| {
+            frames.push(frame);
+        },
+    );
+    engine.impulse(
+        source(),
+        ScrollStream::Wheel,
         wheel(0.0, -1.5),
         base + Duration::from_millis(40),
         neutral(),
@@ -278,12 +291,26 @@ fn synthetic_opposing_impulses_cancel_before_output() {
     let base = Instant::now();
     let mut engine = ScrollEngine::default();
     let mut frames = Vec::new();
-    engine.impulse(source(), wheel(0.0, 1.0), base, neutral(), &mut |frame| {
-        frames.push(frame);
-    });
-    engine.impulse(source(), wheel(0.0, -1.0), base, neutral(), &mut |frame| {
-        frames.push(frame);
-    });
+    engine.impulse(
+        source(),
+        ScrollStream::Wheel,
+        wheel(0.0, 1.0),
+        base,
+        neutral(),
+        &mut |frame| {
+            frames.push(frame);
+        },
+    );
+    engine.impulse(
+        source(),
+        ScrollStream::Wheel,
+        wheel(0.0, -1.0),
+        base,
+        neutral(),
+        &mut |frame| {
+            frames.push(frame);
+        },
+    );
 
     assert!(frames.is_empty());
     assert!(engine.active.is_empty());
@@ -296,6 +323,7 @@ fn synthetic_delayed_frames_use_absolute_time_not_frame_count() {
     let mut dense_frames = Vec::new();
     dense.impulse(
         source(),
+        ScrollStream::Wheel,
         wheel(0.0, 1.0),
         base,
         tuning(2.0, 100, 1.0),
@@ -313,6 +341,7 @@ fn synthetic_delayed_frames_use_absolute_time_not_frame_count() {
     let mut delayed_frames = Vec::new();
     delayed.impulse(
         source(),
+        ScrollStream::Wheel,
         wheel(0.0, 1.0),
         base,
         tuning(2.0, 100, 1.0),
@@ -340,9 +369,16 @@ fn synthetic_sparse_impulses_form_separate_finite_pulses() {
     let base = Instant::now();
     let mut engine = ScrollEngine::default();
     let mut frames = Vec::new();
-    engine.impulse(source(), wheel(0.0, 1.0), base, neutral(), &mut |frame| {
-        frames.push(frame);
-    });
+    engine.impulse(
+        source(),
+        ScrollStream::Wheel,
+        wheel(0.0, 1.0),
+        base,
+        neutral(),
+        &mut |frame| {
+            frames.push(frame);
+        },
+    );
     engine.advance_due(base + Duration::from_millis(100), &mut |frame| {
         frames.push(frame);
     });
@@ -350,6 +386,7 @@ fn synthetic_sparse_impulses_form_separate_finite_pulses() {
 
     engine.impulse(
         source(),
+        ScrollStream::Wheel,
         wheel(0.0, 2.0),
         base + Duration::from_millis(300),
         neutral(),
@@ -378,15 +415,29 @@ fn cancellation_emits_one_terminal_phase_only_after_output_began() {
     let base = Instant::now();
     let mut engine = ScrollEngine::default();
     let mut frames = Vec::new();
-    engine.impulse(source(), wheel(1.0, 0.0), base, neutral(), &mut |frame| {
-        frames.push(frame);
-    });
+    engine.impulse(
+        source(),
+        ScrollStream::Wheel,
+        wheel(1.0, 0.0),
+        base,
+        neutral(),
+        &mut |frame| {
+            frames.push(frame);
+        },
+    );
     engine.cancel_all(&mut |frame| frames.push(frame));
     assert!(frames.is_empty());
 
-    engine.impulse(source(), wheel(1.0, 0.0), base, neutral(), &mut |frame| {
-        frames.push(frame);
-    });
+    engine.impulse(
+        source(),
+        ScrollStream::Wheel,
+        wheel(1.0, 0.0),
+        base,
+        neutral(),
+        &mut |frame| {
+            frames.push(frame);
+        },
+    );
     engine.advance_due(base + Duration::from_millis(25), &mut |frame| {
         frames.push(frame);
     });
@@ -405,12 +456,26 @@ fn concurrent_sources_share_one_balanced_output_stream() {
     let second = hidpp_source("mouse-b", 1);
     let mut engine = ScrollEngine::default();
     let mut frames = Vec::new();
-    engine.impulse(first, wheel(1.0, 0.0), base, neutral(), &mut |frame| {
-        frames.push(frame);
-    });
-    engine.impulse(second, wheel(0.0, 1.0), base, neutral(), &mut |frame| {
-        frames.push(frame);
-    });
+    engine.impulse(
+        first,
+        ScrollStream::Wheel,
+        wheel(1.0, 0.0),
+        base,
+        neutral(),
+        &mut |frame| {
+            frames.push(frame);
+        },
+    );
+    engine.impulse(
+        second,
+        ScrollStream::Wheel,
+        wheel(0.0, 1.0),
+        base,
+        neutral(),
+        &mut |frame| {
+            frames.push(frame);
+        },
+    );
     engine.advance_due(base + Duration::from_millis(25), &mut |frame| {
         frames.push(frame);
     });
@@ -448,9 +513,17 @@ fn source_cancellation_does_not_interrupt_another_source() {
     let second = hidpp_source("mouse-b", 1);
     let mut engine = ScrollEngine::default();
     let mut frames = Vec::new();
-    engine.impulse(first.clone(), wheel(1.0, 0.0), base, neutral(), &mut |_| {});
+    engine.impulse(
+        first.clone(),
+        ScrollStream::Wheel,
+        wheel(1.0, 0.0),
+        base,
+        neutral(),
+        &mut |_| {},
+    );
     engine.impulse(
         second.clone(),
+        ScrollStream::Wheel,
         wheel(0.0, 1.0),
         base,
         neutral(),
@@ -494,6 +567,7 @@ fn same_sign_input_never_emits_an_opposing_frame() {
     for millis in [0, 10, 20, 50] {
         engine.impulse(
             source(),
+            ScrollStream::Wheel,
             wheel(0.0, 1.0),
             base + Duration::from_millis(millis),
             tuning(3.0, 360, 7.0),
@@ -521,6 +595,7 @@ fn free_spin_burst_keeps_the_pulse_count_bounded() {
     for millis in 0..600 {
         engine.impulse(
             source(),
+            ScrollStream::Wheel,
             wheel(0.0, 0.1),
             base + Duration::from_millis(millis),
             long_glide,
@@ -589,6 +664,7 @@ fn quick_reversal_of_preaccelerated_input_restarts_cold() {
     for (millis, delta) in [(0, -5.0), (50, -5.0), (90, 5.0)] {
         engine.impulse(
             source(),
+            ScrollStream::Wheel,
             wheel(0.0, delta),
             base + Duration::from_millis(millis),
             preaccelerated(),
@@ -613,6 +689,7 @@ fn leisurely_reversal_skips_the_ramp_but_still_compresses() {
     for (millis, delta) in [(0, -5.0), (50, -5.0), (460, 5.0)] {
         engine.impulse(
             source(),
+            ScrollStream::Wheel,
             wheel(0.0, delta),
             base + Duration::from_millis(millis),
             preaccelerated(),
@@ -636,6 +713,7 @@ fn free_spin_jitter_never_scales_the_resumed_direction() {
     for (millis, delta) in [(0, -5.0), (50, -5.0), (80, 0.2), (120, -5.0)] {
         engine.impulse(
             source(),
+            ScrollStream::Wheel,
             wheel(0.0, delta),
             base + Duration::from_millis(millis),
             preaccelerated(),
@@ -659,6 +737,7 @@ fn raw_input_reverses_without_attenuation() {
     for (millis, delta) in [(0, -5.0), (8, 5.0)] {
         engine.impulse(
             source(),
+            ScrollStream::Wheel,
             wheel(0.0, delta),
             base + Duration::from_millis(millis),
             neutral(),
@@ -669,5 +748,258 @@ fn raw_input_reverses_without_attenuation() {
         frames.push(frame);
     });
     assert_delta(cumulative(&frames), wheel(0.0, 0.0));
+    assert!(engine.active.is_empty());
+}
+
+/// Step 1×, no acceleration, with the gesture stream's hold.
+fn gesture() -> MotionTuning {
+    MotionTuning {
+        hold: GESTURE_HOLD,
+        ..neutral()
+    }
+}
+
+fn phases(frames: &[ScrollFrame], stream: ScrollStream) -> Vec<SmoothScrollPhase> {
+    frames
+        .iter()
+        .filter(|frame| frame.stream == stream)
+        .map(|frame| frame.phase)
+        .collect()
+}
+
+#[test]
+fn gesture_hold_keeps_the_stream_open_until_the_wheel_stops() {
+    let base = Instant::now();
+    let mut engine = ScrollEngine::default();
+    let mut frames = Vec::new();
+    let source = hidpp_source("mouse-a", 1);
+    engine.impulse(
+        source.clone(),
+        ScrollStream::Gesture,
+        wheel(1.0, 0.0),
+        base,
+        gesture(),
+        &mut |frame| frames.push(frame),
+    );
+    engine.advance_due(base + Duration::from_millis(100), &mut |frame| {
+        frames.push(frame);
+    });
+    // The pulse has settled but the hold has not lapsed: distance complete,
+    // stream still open.
+    assert_delta(cumulative(&frames), wheel(1.0, 0.0));
+    assert!(
+        !phases(&frames, ScrollStream::Gesture).contains(&SmoothScrollPhase::Ended),
+        "gesture ended before its hold lapsed"
+    );
+    assert!(engine.active.contains_key(&source));
+
+    // A second tick inside the hold extends the same gesture.
+    engine.impulse(
+        source.clone(),
+        ScrollStream::Gesture,
+        wheel(1.0, 0.0),
+        base + Duration::from_millis(200),
+        gesture(),
+        &mut |frame| frames.push(frame),
+    );
+    engine.advance_due(base + Duration::from_millis(300), &mut |frame| {
+        frames.push(frame);
+    });
+    assert_delta(cumulative(&frames), wheel(2.0, 0.0));
+    assert_eq!(
+        phases(&frames, ScrollStream::Gesture)
+            .iter()
+            .filter(|phase| **phase == SmoothScrollPhase::Began)
+            .count(),
+        1,
+        "one roll is one gesture"
+    );
+
+    // Hold lapses 150 ms after the last tick: a zero-distance Ended closes it.
+    engine.advance_due(base + Duration::from_millis(350), &mut |frame| {
+        frames.push(frame);
+    });
+    let last = frames.last().expect("terminal frame");
+    assert_eq!(last.stream, ScrollStream::Gesture);
+    assert_eq!(last.phase, SmoothScrollPhase::Ended);
+    assert_delta(last.delta, WheelDelta::ZERO);
+    assert!(engine.active.is_empty());
+    assert!(phases(&frames, ScrollStream::Wheel).is_empty());
+}
+
+#[test]
+fn gesture_and_wheel_streams_keep_independent_lifecycles() {
+    let base = Instant::now();
+    let mut engine = ScrollEngine::default();
+    let mut frames = Vec::new();
+    engine.impulse(
+        source(),
+        ScrollStream::Wheel,
+        wheel(0.0, 1.0),
+        base,
+        neutral(),
+        &mut |frame| frames.push(frame),
+    );
+    engine.advance_due(base + Duration::from_millis(25), &mut |frame| {
+        frames.push(frame);
+    });
+    assert_eq!(
+        phases(&frames, ScrollStream::Wheel).first(),
+        Some(&SmoothScrollPhase::Began)
+    );
+
+    // The gesture begins while the wheel stream is mid-animation, and still
+    // opens with its own Began.
+    engine.impulse(
+        hidpp_source("mouse-a", 1),
+        ScrollStream::Gesture,
+        wheel(1.0, 0.0),
+        base + Duration::from_millis(25),
+        gesture(),
+        &mut |frame| frames.push(frame),
+    );
+    engine.advance_due(base + Duration::from_millis(50), &mut |frame| {
+        frames.push(frame);
+    });
+    assert_eq!(
+        phases(&frames, ScrollStream::Gesture).first(),
+        Some(&SmoothScrollPhase::Began)
+    );
+
+    // The wheel finishes first and ends its own stream without touching the
+    // still-open gesture.
+    engine.advance_due(base + Duration::from_millis(100), &mut |frame| {
+        frames.push(frame);
+    });
+    assert_eq!(
+        phases(&frames, ScrollStream::Wheel).last(),
+        Some(&SmoothScrollPhase::Ended)
+    );
+    assert!(!phases(&frames, ScrollStream::Gesture).contains(&SmoothScrollPhase::Ended));
+
+    engine.advance_due(base + Duration::from_millis(300), &mut |frame| {
+        frames.push(frame);
+    });
+    assert_eq!(
+        phases(&frames, ScrollStream::Gesture).last(),
+        Some(&SmoothScrollPhase::Ended)
+    );
+    assert!(engine.active.is_empty());
+    let gesture_frames: Vec<_> = frames
+        .iter()
+        .filter(|frame| frame.stream == ScrollStream::Gesture)
+        .copied()
+        .collect();
+    assert_delta(cumulative(&gesture_frames), wheel(1.0, 0.0));
+}
+
+#[test]
+fn direct_gesture_lands_each_tick_on_the_next_frame() {
+    let base = Instant::now();
+    let mut engine = ScrollEngine::default();
+    let mut frames = Vec::new();
+    engine.impulse(
+        hidpp_source("mouse-a", 1),
+        ScrollStream::Gesture,
+        wheel(2.0, 0.0),
+        base,
+        MotionTuning::direct_gesture(),
+        &mut |frame| frames.push(frame),
+    );
+    engine.advance_due(base + FRAME_INTERVAL, &mut |frame| frames.push(frame));
+    assert_delta(cumulative(&frames), wheel(2.0, 0.0));
+    assert_eq!(
+        phases(&frames, ScrollStream::Gesture),
+        vec![SmoothScrollPhase::Began]
+    );
+
+    engine.advance_due(base + FRAME_INTERVAL + GESTURE_HOLD, &mut |frame| {
+        frames.push(frame);
+    });
+    assert_eq!(
+        phases(&frames, ScrollStream::Gesture),
+        vec![SmoothScrollPhase::Began, SmoothScrollPhase::Ended]
+    );
+    assert!(engine.active.is_empty());
+}
+
+#[test]
+fn a_source_changing_streams_closes_the_old_lifecycle_first() {
+    let base = Instant::now();
+    let mut engine = ScrollEngine::default();
+    let mut frames = Vec::new();
+    let source = hidpp_source("mouse-a", 1);
+    engine.impulse(
+        source.clone(),
+        ScrollStream::Wheel,
+        wheel(1.0, 0.0),
+        base,
+        neutral(),
+        &mut |frame| frames.push(frame),
+    );
+    engine.advance_due(base + Duration::from_millis(25), &mut |frame| {
+        frames.push(frame);
+    });
+    engine.impulse(
+        source.clone(),
+        ScrollStream::Gesture,
+        wheel(1.0, 0.0),
+        base + Duration::from_millis(30),
+        gesture(),
+        &mut |frame| frames.push(frame),
+    );
+    assert_eq!(
+        phases(&frames, ScrollStream::Wheel),
+        vec![SmoothScrollPhase::Began, SmoothScrollPhase::Cancelled]
+    );
+    engine.advance_due(base + Duration::from_millis(50), &mut |frame| {
+        frames.push(frame);
+    });
+    assert_eq!(
+        phases(&frames, ScrollStream::Gesture),
+        vec![SmoothScrollPhase::Began]
+    );
+    assert_eq!(engine.active.len(), 1);
+}
+
+#[test]
+fn cancelling_the_wheel_stream_leaves_gestures_running() {
+    let base = Instant::now();
+    let mut engine = ScrollEngine::default();
+    let mut frames = Vec::new();
+    engine.impulse(
+        source(),
+        ScrollStream::Wheel,
+        wheel(0.0, 1.0),
+        base,
+        neutral(),
+        &mut |frame| frames.push(frame),
+    );
+    engine.impulse(
+        hidpp_source("mouse-a", 1),
+        ScrollStream::Gesture,
+        wheel(1.0, 0.0),
+        base,
+        gesture(),
+        &mut |frame| frames.push(frame),
+    );
+    engine.advance_due(base + Duration::from_millis(25), &mut |frame| {
+        frames.push(frame);
+    });
+    engine.cancel_stream(ScrollStream::Wheel, &mut |frame| frames.push(frame));
+    assert_eq!(
+        phases(&frames, ScrollStream::Wheel).last(),
+        Some(&SmoothScrollPhase::Cancelled)
+    );
+    assert!(!phases(&frames, ScrollStream::Gesture).contains(&SmoothScrollPhase::Cancelled));
+    assert_eq!(engine.active.len(), 1);
+
+    engine.advance_due(base + Duration::from_millis(300), &mut |frame| {
+        frames.push(frame);
+    });
+    assert_eq!(
+        phases(&frames, ScrollStream::Gesture).last(),
+        Some(&SmoothScrollPhase::Ended)
+    );
     assert!(engine.active.is_empty());
 }
