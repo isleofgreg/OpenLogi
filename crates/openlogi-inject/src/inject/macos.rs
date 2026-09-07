@@ -37,11 +37,36 @@ const POINTS_PER_WHEEL_TICK: f64 = 10.0;
 const SCROLL_WHEEL_EVENT_SCROLL_PHASE: u32 = 99; // kCGScrollWheelEventScrollPhase
 const SCROLL_WHEEL_EVENT_MOMENTUM_PHASE: u32 = 123; // kCGScrollWheelEventMomentumPhase
 
-/// `NSEventPhase` bits as they appear in `kCGScrollWheelEventScrollPhase`.
+/// Phase bits as `kCGScrollWheelEventScrollPhase` carries them: the IOHID
+/// event phase (`IOHIDEventTypes.h`), which AppKit maps to `NSEventPhase`.
+/// Not `NSEventPhase`'s own 1/4/8/16 — that numbering reads Changed as
+/// Ended, which collapses a swipe on its second frame (measured 2026-09-07
+/// against Reminders' row swipe).
 const SCROLL_PHASE_BEGAN: i64 = 1;
-const SCROLL_PHASE_CHANGED: i64 = 4;
-const SCROLL_PHASE_ENDED: i64 = 8;
-const SCROLL_PHASE_CANCELLED: i64 = 16;
+const SCROLL_PHASE_CHANGED: i64 = 2;
+const SCROLL_PHASE_ENDED: i64 = 4;
+const SCROLL_PHASE_CANCELLED: i64 = 8;
+/// The zero-distance frame a trackpad sends when fingers land, before Began.
+const SCROLL_PHASE_MAY_BEGIN: i64 = 128;
+/// `kCGMomentumScrollPhase` value that tells apps with their own coasting
+/// (Xcode, some WebKit views) that no momentum follows a finished gesture.
+const MOMENTUM_PHASE_END: i64 = 3;
+
+// The companion gesture event a trackpad emits with every phased scroll
+// frame: `NSEventTypeGesture` carrying `kIOHIDEventTypeScroll`. Row swipes
+// (Reminders, Mail) recognise the gesture from this event, not from the
+// scroll event's phase alone — measured 2026-09-07 with a field-by-field
+// replay of a Magic Trackpad swipe: phased scroll frames on their own only
+// nudge the row; with these companions it slides open. Field ids are the
+// raw `CGEventField` values (undocumented, stable since 10.x; the same set
+// Mac Mouse Fix drives).
+const EVENT_FIELD_TYPE: u32 = 55;
+const EVENT_TYPE_GESTURE: i64 = 29; // NSEventTypeGesture
+const GESTURE_FIELD_HID_TYPE: u32 = 110;
+const GESTURE_HID_TYPE_SCROLL: i64 = 6; // kIOHIDEventTypeScroll
+const GESTURE_FIELD_DELTA_X: u32 = 116;
+const GESTURE_FIELD_DELTA_Y: u32 = 119;
+const GESTURE_FIELD_PHASE: u32 = 132;
 
 /// Gesture-stream output state: the fractional residual plus whether a
 /// phased stream is open at the OS. The engine's lifecycle is balanced in
@@ -756,17 +781,50 @@ pub(super) fn post_gesture_scroll(delta: ScrollDelta, phase: SmoothScrollPhase) 
         tracing::warn!("CGEventSource::new failed for gesture scroll");
         return;
     };
+    // Fingers land before they move: the recogniser expects the MayBegin
+    // frame a trackpad sends first.
+    if phase_value == SCROLL_PHASE_BEGAN {
+        post_gesture_frame(&src, QuantizedScroll::default(), SCROLL_PHASE_MAY_BEGIN, 0);
+    }
+    post_gesture_frame(&src, quantized, phase_value, 0);
+    // A finished gesture whose last frame still carried distance reads as a
+    // flick to apps that coast on their own; a momentum-end frame with no
+    // gesture phase tells them nothing follows.
+    if phase_value == SCROLL_PHASE_ENDED {
+        post_gesture_frame(&src, QuantizedScroll::default(), 0, MOMENTUM_PHASE_END);
+    }
+}
+
+/// Post one frame of the gesture stream: the continuous scroll event stamped
+/// with `phase`/`momentum`, followed — for any gesture phase — by the
+/// companion `NSEventTypeGesture` scroll event carrying the same distance.
+fn post_gesture_frame(src: &CGEventSource, delta: QuantizedScroll, phase: i64, momentum: i64) {
     let Ok(ev) =
-        CGEvent::new_scroll_event(src, ScrollEventUnit::PIXEL, 2, quantized.y, quantized.x, 0)
+        CGEvent::new_scroll_event(src.clone(), ScrollEventUnit::PIXEL, 2, delta.y, delta.x, 0)
     else {
         tracing::warn!("CGEvent::new_scroll_event failed for gesture scroll");
         return;
     };
-    set_continuous_scroll_fields(&ev, quantized);
-    ev.set_integer_value_field(SCROLL_WHEEL_EVENT_SCROLL_PHASE, phase_value);
-    ev.set_integer_value_field(SCROLL_WHEEL_EVENT_MOMENTUM_PHASE, 0);
+    set_continuous_scroll_fields(&ev, delta);
+    ev.set_integer_value_field(SCROLL_WHEEL_EVENT_SCROLL_PHASE, phase);
+    ev.set_integer_value_field(SCROLL_WHEEL_EVENT_MOMENTUM_PHASE, momentum);
     tag_synthetic(&ev);
     ev.post(CGEventTapLocation::HID);
+
+    if phase == 0 {
+        return;
+    }
+    let Ok(gesture) = CGEvent::new(src.clone()) else {
+        tracing::warn!("CGEvent::new failed for gesture companion");
+        return;
+    };
+    gesture.set_integer_value_field(EVENT_FIELD_TYPE, EVENT_TYPE_GESTURE);
+    gesture.set_integer_value_field(GESTURE_FIELD_HID_TYPE, GESTURE_HID_TYPE_SCROLL);
+    gesture.set_double_value_field(GESTURE_FIELD_DELTA_X, f64::from(delta.x));
+    gesture.set_double_value_field(GESTURE_FIELD_DELTA_Y, f64::from(delta.y));
+    gesture.set_integer_value_field(GESTURE_FIELD_PHASE, phase);
+    tag_synthetic(&gesture);
+    gesture.post(CGEventTapLocation::HID);
 }
 
 fn set_continuous_scroll_fields(event: &CGEvent, delta: QuantizedScroll) {
