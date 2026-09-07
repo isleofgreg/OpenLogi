@@ -68,6 +68,9 @@ pub struct DispatchPlan {
     /// Pointer identity used to select these mouse bindings; absent for the
     /// explicitly focused policy and keyboard input.
     pub pointer_target: Option<openlogi_hook::PointerTarget>,
+    /// Whether this device's re-synthesised thumb-wheel scroll joins the
+    /// phased gesture stream (app-wide preference) or the phaseless wheel one.
+    pub thumbwheel_gesture_scroll: bool,
 }
 
 /// One device's independently versioned hardware target and dispatch plan.
@@ -239,6 +242,7 @@ pub fn plan_for_device(
             side_gesture_bindings,
             thumbwheel_sensitivity,
             pointer_target: None,
+            thumbwheel_gesture_scroll: config.app_settings.thumbwheel_gesture_scroll,
         },
     }
 }

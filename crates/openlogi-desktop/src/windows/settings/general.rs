@@ -30,6 +30,7 @@ pub(super) fn general_page(
     let group = SettingGroup::new()
         .item(mouse_profile_target_item())
         .item(smooth_scrolling_item())
+        .items(cfg!(target_os = "macos").then(thumbwheel_gesture_scroll_item))
         .item(
             SettingItem::new(
                 tr!("pointer.vertical_scroll_sensitivity"),
@@ -136,6 +137,25 @@ fn smooth_scrolling_item() -> SettingItem {
         ),
     )
     .description(tr!("pointer.smooth_scrolling_description"))
+}
+
+/// The thumb-wheel gesture switch: macOS only, since it is the scroll phase
+/// that turns the wheel's output into a swipe and no other platform has one.
+fn thumbwheel_gesture_scroll_item() -> SettingItem {
+    SettingItem::new(
+        tr!("Thumb wheel swipes"),
+        SettingField::switch(
+            |cx| {
+                AppState::try_read(cx).is_some_and(|s| s.app_settings().thumbwheel_gesture_scroll)
+            },
+            |enabled, cx| {
+                AppState::apply(cx, |state| state.commit_thumbwheel_gesture_scroll(enabled));
+            },
+        ),
+    )
+    .description(tr!(
+        "Scroll the thumb wheel as a trackpad gesture so swipe actions respond, such as swiping a reminder or a message to reveal Delete."
+    ))
 }
 
 fn thumbwheel_sensitivity_field(slider: &Entity<SliderState>, cx: &mut App) -> gpui::Div {

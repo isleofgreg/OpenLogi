@@ -486,16 +486,16 @@ pub fn post_scroll(delta: ScrollDelta) {
     }
 }
 
-/// Lifecycle phase of one synthetic smooth-scroll frame.
+/// Lifecycle phase of one synthetic scroll frame.
 ///
-/// Part of the runtime contract — the motion engine emits a balanced
-/// lifecycle. Smoothed wheel output ([`post_smooth_scroll`]) does not forward
-/// it: macOS deliberately posts *phaseless* continuous events there (matching
-/// wheel semantics), because stamping `kCGScrollWheelEventScrollPhase`
-/// declares a trackpad gesture, which enables rubber-band overscroll and
-/// WebKit gesture latching that breaks JS-scrolled sites. Only an intended
-/// gesture ([`post_phased_scroll`]) carries the phase on macOS. Linux and
-/// Windows have no equivalent field.
+/// The motion engine emits a balanced lifecycle for every stream. Smoothed
+/// wheel frames ([`post_smooth_scroll`]) stay deliberately *phaseless*: on
+/// macOS a phased main wheel enables rubber-band overscroll and WebKit gesture
+/// latching that breaks JS-scrolled sites. Only intended gestures forward the
+/// phase, landing in `kCGScrollWheelEventScrollPhase`: the thumb wheel's
+/// gesture stream ([`post_gesture_scroll`]) and the unsmoothed horizontal
+/// wheel gesture ([`post_phased_scroll`]). Linux and Windows have no
+/// equivalent field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SmoothScrollPhase {
     /// First output frame of a new animation.
@@ -549,6 +549,31 @@ pub fn post_phased_scroll(delta: ScrollDelta, phase: SmoothScrollPhase) {
         }
         _ => {
             post_smooth_scroll(delta, phase);
+        }
+    }
+}
+
+/// Synthesise one frame of a trackpad-style scroll gesture.
+///
+/// On macOS the frame is a continuous pixel event stamped with its scroll
+/// phase, so the stream reads as a two-finger swipe: swipe actions (row
+/// swipes in Reminders and Mail, Finder's column swipes) respond to it, where
+/// the phaseless wheel output of [`post_smooth_scroll`] only scrolls. A frame
+/// that quantizes to zero opens no gesture, and a terminal frame is posted
+/// even at zero distance so an open gesture always closes. Other platforms
+/// carry no phase and fall back to [`post_scroll`]. Non-finite distance is
+/// rejected at this I/O boundary.
+pub fn post_gesture_scroll(delta: ScrollDelta, phase: SmoothScrollPhase) {
+    if !delta.is_finite() {
+        return;
+    }
+    cfg_select! {
+        target_os = "macos" => {
+            macos::post_gesture_scroll(delta, phase);
+        }
+        _ => {
+            let _ = phase;
+            post_scroll(delta);
         }
     }
 }
