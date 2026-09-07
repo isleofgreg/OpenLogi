@@ -43,7 +43,7 @@ use super::shutdown::{ManagerCompletion, WatcherHandle};
 use crate::capture_plan::{CaptureTarget, DeviceCapturePlan, DispatchPlan, SharedCapturePlans};
 use crate::receiver_access::{ReceiverAccess, ReceiverRequestState, SessionReceiverLease};
 use crate::runtime::hook::SharedHookMaps;
-use crate::runtime::scroll::ScrollInputHandle;
+use crate::runtime::scroll::{ScrollInputHandle, ScrollStream};
 use crate::runtime::{ActionDispatcher, HidppSessionId};
 
 const RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -76,10 +76,12 @@ impl GestureOutputs {
         self.scroll.cancel_hidpp_session(session);
     }
 
-    fn post_scroll(&self, session: &HidppSessionId, delta: ScrollDelta) {
-        if !self.scroll.try_hidpp_scroll(session, delta) {
+    fn post_scroll(&self, session: &HidppSessionId, delta: ScrollDelta, stream: ScrollStream) {
+        if !self.scroll.try_hidpp_scroll(session, delta, stream) {
             // HID++ diversion consumed the physical input already, so direct
-            // synthesis is this source's fail-open path.
+            // synthesis is this source's fail-open path. A phased gesture
+            // needs the worker's lifecycle, so this fallback is always the
+            // phaseless wheel form.
             openlogi_inject::post_scroll(delta);
         }
     }
