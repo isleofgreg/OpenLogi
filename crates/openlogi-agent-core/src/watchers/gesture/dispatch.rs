@@ -15,6 +15,7 @@ use self::wheel::{ScrollScale, WheelAccumulators, WheelOutput, WheelRotation};
 use super::GestureOutputs;
 use crate::capture_plan::DispatchPlan;
 use crate::runtime::hook::SharedHookMaps;
+use crate::runtime::scroll::ScrollStream;
 use crate::runtime::{HidppSessionId, PressToken};
 
 /// Effective thumb-wheel configuration whose continuity is tied to one
@@ -25,6 +26,8 @@ pub(super) struct WheelConfiguration {
     up: Action,
     down: Action,
     sensitivity: ThumbwheelSensitivity,
+    /// Which application-visible stream continuous scroll joins.
+    stream: ScrollStream,
 }
 
 impl WheelConfiguration {
@@ -39,6 +42,11 @@ impl WheelConfiguration {
             up: action(ButtonId::ThumbwheelScrollUp),
             down: action(ButtonId::ThumbwheelScrollDown),
             sensitivity: plan.thumbwheel_sensitivity,
+            stream: if plan.thumbwheel_gesture_scroll {
+                ScrollStream::Gesture
+            } else {
+                ScrollStream::Wheel
+            },
         }
     }
 
@@ -247,11 +255,14 @@ impl InputDispatcher {
             Instant::now(),
         ) {
             WheelOutput::Idle => {}
-            WheelOutput::Scroll(delta) => self.outputs.post_scroll(
-                session,
-                delta,
-                configuration.sensitivity.scroll_multiplier(),
-            ),
+            WheelOutput::Scroll(delta) => {
+                self.outputs.post_scroll(
+                    session,
+                    delta,
+                    configuration.stream,
+                    configuration.sensitivity.scroll_multiplier(),
+                );
+            }
             WheelOutput::FireAction => {
                 debug!(key, ?button, action = %action.label(), "thumb wheel → action");
                 self.outputs.actions.dispatch_pointer_action(
