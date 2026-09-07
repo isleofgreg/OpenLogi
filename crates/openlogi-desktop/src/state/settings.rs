@@ -304,6 +304,19 @@ impl AppState {
         self.persist_and_reload("smooth scroll");
         StateEvent::SettingsChanged.into()
     }
+    /// Toggle whether the thumb wheel scrolls as a trackpad-style gesture
+    /// (phased, so swipe actions respond) and persist it. The agent rebuilds
+    /// its capture plans on config reload. An already-set value writes nothing
+    /// and is still reported; disk failures restore the persisted value.
+    pub fn commit_thumbwheel_gesture_scroll(&mut self, enabled: bool) -> StateEvents {
+        if self.config.app_settings.thumbwheel_gesture_scroll == enabled {
+            return StateEvent::SettingsChanged.into();
+        }
+        self.config
+            .edit(|config| config.app_settings.thumbwheel_gesture_scroll = enabled);
+        self.persist_and_reload("thumb wheel gesture scroll");
+        StateEvent::SettingsChanged.into()
+    }
     /// Set traditional vertical mouse-wheel sensitivity and persist it. The
     /// agent publishes the value to its scroll worker on config reload. An
     /// already-set value writes nothing and is still reported; disk failures
