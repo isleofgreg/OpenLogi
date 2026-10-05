@@ -369,6 +369,9 @@ impl Running {
                 self.orchestrator.lock().await.set_camera_active(active);
             }
             WatcherEvent::App(app) => self.apply_foreground(app).await,
+            WatcherEvent::Pointer(context) if self.pointer_is_over_the_ring(context.target) => {
+                debug!("pointer is over the Actions Ring — keeping the profile that opened it");
+            }
             WatcherEvent::Pointer(context) => self.apply_pointer_context(context).await,
             WatcherEvent::Accessibility(granted) => self.apply_accessibility(granted).await,
             WatcherEvent::InputMonitoring(granted) => {
@@ -441,6 +444,16 @@ impl Running {
         if self.orchestrator.lock().await.set_current_app(app) {
             self.inputs.dispatcher.cancel_all_buttons();
         }
+    }
+
+    /// While the ring is showing, the pointer is over the ring's own floating
+    /// window, which classifies as `PointerTarget::Unavailable`. Publishing
+    /// that context would rebuild the bindings without the per-app profile, so
+    /// a ring bound only in that app's profile would hear its second trigger
+    /// press as the button's global action and never close. The ring belongs
+    /// to the app it was opened over; its window is not a profile change.
+    fn pointer_is_over_the_ring(&self, target: openlogi_hook::PointerTarget) -> bool {
+        target == openlogi_hook::PointerTarget::Unavailable && self.inputs.ring.is_showing()
     }
 
     async fn apply_pointer_context(&self, context: openlogi_hook::PointerContext) {

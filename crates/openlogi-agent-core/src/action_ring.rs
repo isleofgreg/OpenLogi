@@ -85,6 +85,11 @@ impl State {
         }
     }
 
+    fn showing(&mut self) -> bool {
+        self.expire();
+        matches!(&self.active, Some(session) if !session.actions.is_empty())
+    }
+
     fn active_session(&mut self, session_id: u64) -> Result<&mut Session, ActionRingCommandError> {
         self.expire();
         match self.active.as_mut() {
@@ -168,13 +173,22 @@ impl ActionRingManager {
     /// and opens a fresh ring.
     pub fn dismiss_active(&self) -> bool {
         let mut state = self.state();
-        state.expire();
-        let dismissed = matches!(&state.active, Some(session) if !session.actions.is_empty());
+        let dismissed = state.showing();
         if dismissed {
             state.active = None;
         }
         self.publish(&state);
         dismissed
+    }
+
+    /// Whether a ring is showing that a trigger press would dismiss — the
+    /// same test [`Self::dismiss_active`] makes, without dismissing.
+    pub fn is_showing(&self) -> bool {
+        let mut state = self.state();
+        let showing = state.showing();
+        // `showing` expires a stale session, which the overlay must hear about.
+        self.publish(&state);
+        showing
     }
 
     /// Serve one [`Agent::observe_action_ring`](openlogi_ipc::Agent::observe_action_ring).
@@ -399,6 +413,17 @@ mod tests {
         let invocation = manager.begin(spec());
         manager.cancel(invocation.session_id);
         assert_eq!(manager.observe(0).await.invocation, None);
+    }
+
+    #[test]
+    fn is_showing_tracks_the_session_without_dismissing_it() {
+        let manager = ActionRingManager::default();
+        assert!(!manager.is_showing());
+        let invocation = manager.begin(spec());
+        assert!(manager.is_showing());
+        assert!(manager.is_showing(), "asking must not dismiss the ring");
+        manager.cancel(invocation.session_id);
+        assert!(!manager.is_showing());
     }
 
     #[test]
