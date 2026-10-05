@@ -191,6 +191,13 @@ impl ActionRingManager {
         showing
     }
 
+    /// Hear the ring open and close. Every way a ring ends — a second trigger
+    /// press, a slot activation, the overlay's cancel or timeout — republishes,
+    /// so a subscriber sees each close without polling.
+    pub fn subscribe(&self) -> watch::Receiver<RingObservation> {
+        self.published.subscribe()
+    }
+
     /// Serve one [`Agent::observe_action_ring`](openlogi_ipc::Agent::observe_action_ring).
     pub async fn observe(&self, since: Generation) -> RingObservation {
         let mut rx = self.published.subscribe();
@@ -424,6 +431,29 @@ mod tests {
         assert!(manager.is_showing(), "asking must not dismiss the ring");
         manager.cancel(invocation.session_id);
         assert!(!manager.is_showing());
+    }
+
+    #[test]
+    fn a_subscriber_hears_every_way_a_ring_closes() {
+        let manager = ActionRingManager::default();
+        let mut ring = manager.subscribe();
+        let closes: [fn(&ActionRingManager, u64); 3] = [
+            |manager, _| assert!(manager.dismiss_active()),
+            |manager, session| {
+                manager
+                    .activate(session, ActionRingSlot::Top)
+                    .expect("the open session must be activatable");
+            },
+            |manager, session| manager.cancel(session),
+        ];
+        for close in closes {
+            let invocation = manager.begin(spec());
+            assert!(ring.has_changed().unwrap(), "opening must notify");
+            ring.borrow_and_update();
+            close(&manager, invocation.session_id);
+            assert!(ring.has_changed().unwrap(), "closing must notify");
+            assert_eq!(ring.borrow_and_update().invocation, None);
+        }
     }
 
     #[test]
