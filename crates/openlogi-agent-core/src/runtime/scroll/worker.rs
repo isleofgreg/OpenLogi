@@ -45,6 +45,7 @@ impl ScrollPreferenceSnapshot {
             } else {
                 self.tuning.acceleration.max_gain()
             },
+            vertical_scale: 1.0,
         }
     }
 }
@@ -171,6 +172,9 @@ struct ScrollInput {
     generation: u64,
     source: ScrollSource,
     impulse: WheelDelta,
+    /// Vertical sensitivity already applied to `impulse`, carried so the
+    /// motion model can rate the wheel by its own distance.
+    vertical_scale: f64,
     output: ScrollOutputMode,
 }
 
@@ -270,9 +274,8 @@ impl ScrollInputHandle {
             return false;
         };
         let preferences = self.preferences.load();
-        let Some(scaled) =
-            impulse.with_vertical_scale(preferences.vertical_sensitivity.scroll_multiplier())
-        else {
+        let vertical_scale = preferences.vertical_sensitivity.scroll_multiplier();
+        let Some(scaled) = impulse.with_vertical_scale(vertical_scale) else {
             return false;
         };
         let output = if preferences.smooth_scroll {
@@ -282,7 +285,7 @@ impl ScrollInputHandle {
         } else {
             return false;
         };
-        self.try_enqueue(ScrollSource::current_hook(), scaled, output)
+        self.try_enqueue(ScrollSource::current_hook(), scaled, vertical_scale, output)
     }
 
     /// Queue one diverted thumb-wheel impulse from an active HID++ session.
@@ -309,19 +312,21 @@ impl ScrollInputHandle {
         } else {
             return false;
         };
-        self.try_enqueue(ScrollSource::Hidpp(session.clone()), impulse, output)
+        self.try_enqueue(ScrollSource::Hidpp(session.clone()), impulse, 1.0, output)
     }
 
     fn try_enqueue(
         &self,
         source: ScrollSource,
         impulse: WheelDelta,
+        vertical_scale: f64,
         output: ScrollOutputMode,
     ) -> bool {
         let input = ScrollInput {
             generation: self.generation.load(Ordering::Acquire),
             source,
             impulse,
+            vertical_scale,
             output,
         };
         match self.commands.try_send(ScrollCommand::Input(input)) {
@@ -545,7 +550,10 @@ fn run_worker(
             Ok(ScrollCommand::Input(input)) if cancellations.accepts(&input) => {
                 match input.output {
                     ScrollOutputMode::Smooth { at } if smoothing => {
-                        let tuning = snapshot.motion_tuning(&input.source);
+                        let tuning = MotionTuning {
+                            vertical_scale: input.vertical_scale,
+                            ..snapshot.motion_tuning(&input.source)
+                        };
                         engine.impulse(input.source, input.impulse, at, tuning, emit_smooth);
                     }
                     ScrollOutputMode::Phased { at } if !smoothing => {
@@ -710,6 +718,20 @@ mod tests {
         let queued = queued_input(&receiver);
         assert_eq!(queued.impulse, WheelDelta { x: 2.0, y: 1.0 });
         assert!(matches!(queued.output, ScrollOutputMode::Smooth { .. }));
+    }
+
+    #[test]
+    fn queued_ticks_carry_the_sensitivity_already_applied() {
+        let (input, receiver, _controls) = standalone_input(2, preferences(true, 28));
+        assert!(input.try_hook_scroll(ScrollDelta::wheel_ticks(0.0, 1.0)));
+        let hook = queued_input(&receiver);
+        assert_eq!(hook.impulse, WheelDelta { x: 0.0, y: 2.0 });
+        assert!((hook.vertical_scale - 2.0).abs() < f64::EPSILON);
+
+        let session = HidppSessionId::with_epoch("mouse-a", 7);
+        assert!(input.try_hidpp_scroll(&session, ScrollDelta::wheel_ticks(0.0, 1.0)));
+        let hidpp = queued_input(&receiver);
+        assert!((hidpp.vertical_scale - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1042,6 +1064,7 @@ mod tests {
             generation,
             source: ScrollSource::Hidpp(session.clone()),
             impulse: WheelDelta { x: 0.0, y: 1.0 },
+            vertical_scale: 1.0,
             output: ScrollOutputMode::Direct,
         };
         let mut cancellations = OverflowCancellations::new(0);
@@ -1097,6 +1120,7 @@ mod tests {
                 generation: 1,
                 source: ScrollSource::Hidpp(session.clone()),
                 impulse: WheelDelta { x: 0.0, y: 1.0 },
+                vertical_scale: 1.0,
                 output: ScrollOutputMode::Smooth { at: Instant::now() },
             }))
             .expect("worker command channel remains open");
