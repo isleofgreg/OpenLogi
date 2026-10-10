@@ -647,7 +647,13 @@ fn run_worker(
                                 ..snapshot.motion_tuning(&input.source, input.stream)
                             }
                         } else {
-                            MotionTuning::direct_gesture()
+                            // The rate window outlives a smoothing toggle, so
+                            // even unsmoothed gesture ticks enter it at their
+                            // own wheel distance.
+                            MotionTuning {
+                                distance_scale: input.distance_scale,
+                                ..MotionTuning::direct_gesture()
+                            }
                         };
                         tracing::trace!(
                             x = input.impulse.x,
@@ -691,7 +697,7 @@ fn run_worker(
 
 #[cfg(test)]
 mod tests {
-    use super::super::PHASED_IDLE;
+    use super::super::{PHASED_IDLE, accel_gain};
     use super::*;
 
     fn sensitivity(raw: u8) -> VerticalScrollSensitivity {
@@ -1583,6 +1589,68 @@ mod tests {
             emitted,
             [WheelDelta { x: 0.0, y: 1.0 }, WheelDelta { x: 0.0, y: 3.0 }],
             "the cancelled session must not emit, and other sources must"
+        );
+    }
+
+    #[test]
+    fn unsmoothed_gesture_ticks_enter_the_rate_window_at_wheel_distance() {
+        // At thumb-wheel sensitivity 100 each notch is queued as 100/14 lines.
+        // A gesture tick sent while smoothing is off still lands in the
+        // engine's rate window, and must count there as one notch, so the
+        // smoothed tick 50 ms later after smoothing comes on accelerates as
+        // the second of two notches.
+        let scale = 100.0 / 14.0;
+        let session = HidppSessionId::with_epoch("mouse-a", 7);
+        let base = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("the monotonic clock has run for two seconds");
+        let tick = |at| {
+            Ok(ScrollCommand::Input(ScrollInput {
+                generation: 0,
+                source: ScrollSource::Hidpp(session.clone()),
+                stream: ScrollStream::Gesture,
+                impulse: WheelDelta { x: scale, y: 0.0 },
+                distance_scale: WheelDelta { x: scale, y: scale },
+                output: ScrollOutputMode::Smooth { at },
+            }))
+        };
+        let accelerated = SmoothScrollTuning {
+            acceleration: SmoothScrollAcceleration::MAX,
+            ..neutral_tuning()
+        };
+        let preferences = preferences(false, 14);
+        let (_controls, control_rx) = mpsc::channel();
+        let generation = AtomicU64::new(0);
+        let mut calls = 0;
+        let mut travelled = 0.0;
+
+        run_worker(
+            |_| {
+                calls += 1;
+                match calls {
+                    1 => tick(base),
+                    2 => {
+                        preferences.publish(true, sensitivity(14), accelerated);
+                        tick(base + Duration::from_millis(50))
+                    }
+                    3 => Err(mpsc::RecvTimeoutError::Timeout),
+                    _ => Err(mpsc::RecvTimeoutError::Disconnected),
+                }
+            },
+            &control_rx,
+            &generation,
+            &preferences,
+            &mut |frame| travelled += frame.delta.x,
+            &mut |_| {},
+        );
+
+        let smoothed = preferences
+            .load()
+            .motion_tuning(&ScrollSource::Hidpp(session.clone()), ScrollStream::Gesture);
+        let expected = scale + scale * smoothed.step * accel_gain(2.0, smoothed.max_gain);
+        assert!(
+            (travelled - expected).abs() < 1.0e-9,
+            "travelled {travelled}, expected {expected}"
         );
     }
 
