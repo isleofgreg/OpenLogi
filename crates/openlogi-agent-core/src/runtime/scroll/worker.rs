@@ -388,9 +388,10 @@ impl ScrollInputHandle {
     ///
     /// The distance the already-diverted caller must inject directly when the
     /// runtime is stopped or its queue is full. It carries the same
-    /// sensitivity scaling, so a refused report scrolls as far as a queued
-    /// one. A delta that cannot be eased (not finite wheel ticks, or zero)
-    /// comes back as given.
+    /// sensitivity scaling and the configured step, so a refused report
+    /// scrolls as far as a queued one would without acceleration, which only
+    /// the worker's rate window can supply. A delta that cannot be eased (not
+    /// finite wheel ticks, or zero) comes back as given.
     pub(crate) fn try_hidpp_wheel_scroll(
         &self,
         session: &HidppSessionId,
@@ -399,7 +400,8 @@ impl ScrollInputHandle {
         let Ok(impulse) = WheelDelta::try_from(delta) else {
             return Err(delta);
         };
-        let multiplier = self.preferences.vertical_sensitivity().scroll_multiplier();
+        let preferences = self.preferences.load();
+        let multiplier = preferences.vertical_sensitivity.scroll_multiplier();
         let Some(scaled) = impulse.with_vertical_scale(multiplier) else {
             return Err(delta);
         };
@@ -413,7 +415,11 @@ impl ScrollInputHandle {
                 },
                 ScrollOutputMode::Eased { at: Instant::now() },
             );
-        if queued { Ok(()) } else { Err(scaled.into()) }
+        if queued {
+            Ok(())
+        } else {
+            Err(scaled.scale(preferences.tuning.step.multiplier()).into())
+        }
     }
 
     fn try_enqueue(
@@ -908,8 +914,7 @@ mod tests {
     }
 
     /// What the runtime cannot ease comes back as given; what it cannot
-    /// queue comes back scaled, so the caller's direct injection scrolls as
-    /// far as the eased output would have.
+    /// queue comes back scaled (here by sensitivity alone, at step 1).
     #[test]
     fn a_diverted_main_wheel_hands_back_what_it_cannot_take() {
         let (input, receiver, _controls) = standalone_input(1, preferences(true, 7));
@@ -934,6 +939,59 @@ mod tests {
             Err(scaled),
             "a stopped runtime hands back the scaled distance"
         );
+    }
+
+    /// A refused tick is handed back at the configured step, so the caller's
+    /// direct injection travels as far as the eased output of the same
+    /// isolated tick.
+    #[test]
+    fn a_refused_main_wheel_tick_travels_as_far_as_an_eased_one() {
+        let tuning = SmoothScrollTuning {
+            step: SmoothScrollStep::try_new(3).expect("valid step"),
+            ..neutral_tuning()
+        };
+        let preferences = || Arc::new(ScrollPreferences::new(true, sensitivity(7), tuning));
+        let session = HidppSessionId::with_epoch("mouse-a", 7);
+        let tick = ScrollDelta::wheel_ticks(0.0, 2.0);
+
+        let (frames, eased_frames) = mpsc::channel();
+        let mut runtime = ScrollRuntime::spawn_with(
+            preferences(),
+            move |frame| {
+                frames
+                    .send(frame)
+                    .expect("test frame receiver remains open");
+            },
+            |_| {},
+        )
+        .expect("spawn scroll worker");
+        assert_eq!(
+            runtime.input().try_hidpp_wheel_scroll(&session, tick),
+            Ok(())
+        );
+        let mut eased = 0.0;
+        while let Ok(frame) = eased_frames.recv_timeout(Duration::from_secs(1)) {
+            eased += frame.delta.y;
+            if matches!(
+                frame.phase,
+                openlogi_inject::SmoothScrollPhase::Ended
+                    | openlogi_inject::SmoothScrollPhase::Cancelled
+            ) {
+                break;
+            }
+        }
+        runtime.shutdown();
+
+        let (input, receiver, _controls) = standalone_input(1, preferences());
+        assert_eq!(input.try_hidpp_wheel_scroll(&session, tick), Ok(()));
+        let Err(ScrollDelta::WheelTicks { x, y }) = input.try_hidpp_wheel_scroll(&session, tick)
+        else {
+            panic!("a full queue hands the tick back as wheel ticks");
+        };
+        queued_input(&receiver);
+        assert!(x.abs() < f64::EPSILON);
+        assert!((y - 3.0).abs() < 1e-9, "handed back {y}");
+        assert!((eased - y).abs() < 1e-6, "eased {eased}, handed back {y}");
     }
 
     #[test]
